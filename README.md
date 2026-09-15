@@ -167,6 +167,15 @@ with a median of 6 and a tail to 46, and until something predicts the real
 case, guessing on the caller's behalf would be worse than letting them
 measure. See [`docs/improvements.md`](docs/improvements.md).
 
+## How it compares
+
+[simdcsv](https://github.com/geofflangdale/simdcsv) applies the simdjson
+techniques to RFC 4180, and on the same documents its structural scan finds
+exactly the same delimiters about **eleven times faster** — 11.1 GB/s against
+our 1.03. Half that gap is bookkeeping we could drop tomorrow and half is a
+scan built on tricks we would have to hand-roll in Mojo. Both are measured and
+written up in [`docs/improvements.md`](docs/improvements.md).
+
 ## Development
 
 ```bash
