@@ -42,6 +42,9 @@ up to 4x on documents with long fields and loses by 10-20% on documents with
 short ones. It is the default because the downside is small and the upside is
 not, but if you are parsing one shape of document repeatedly, measure.
 
+**Documents must be under 2 GiB.** Field positions are indexed with 31 bits
+and a flag; a larger document aborts with a message saying so.
+
 **Rows must be rectangular.** RFC 4180 says every row holds the same number of
 fields, and `get(row, column)` assumes it. `is_ragged()` reports a document
 that breaks the rule, and its fields can still be read in order through
@@ -104,23 +107,23 @@ fraction and field-length distribution. It prints the shape it produced.
 
 | | ms | MiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| parse, `simd=True` | 25.8 | 852 | 12.6 |
-| parse, `simd=False` | **22.5** | **977** | **11.0** |
-| read all, `field` (slice) | **3.4** | **6465** | **1.7** |
-| read all, `get` (String) | 25.2 | 872 | 12.3 |
-| build, `escape=False` | **20.0** | **1099** | **9.8** |
-| build, `escape=True` | 32.8 | 670 | 16.1 |
+| parse, `simd=True` | 22.8 | 965 | 11.2 |
+| parse, `simd=False` | **21.8** | **1009** | **10.7** |
+| read all, `field` (slice) | **3.4** | **6468** | **1.7** |
+| read all, `get` (String) | 25.7 | 854 | 12.6 |
+| build, `escape=False` | **19.1** | **1151** | **9.3** |
+| build, `escape=True` | 32.1 | 686 | 15.7 |
 
 **`needs_escaping.csv`** — 24.9 MB, 201 182 rows, 10 columns, 10% quoted:
 
 | | ms | MiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| parse, `simd=True` | 28.7 | 827 | 14.3 |
-| parse, `simd=False` | **24.1** | **983** | **12.0** |
-| read all, `field` (slice) | **3.2** | **7315** | **1.6** |
-| read all, `get` (String) | 34.2 | 695 | 17.0 |
-| build, `escape=False` | **20.5** | **1160** | **10.2** |
-| build, `escape=True` | 36.0 | 681 | 17.9 |
+| parse, `simd=True` | 26.1 | 908 | 13.0 |
+| parse, `simd=False` | **23.6** | **1008** | **11.7** |
+| read all, `field` (slice) | **3.3** | **7106** | **1.7** |
+| read all, `get` (String) | 34.7 | 684 | 17.2 |
+| build, `escape=False` | **20.0** | **1186** | **9.9** |
+| build, `escape=True` | 35.5 | 690 | 17.7 |
 
 Two things to read off these.
 
@@ -146,23 +149,24 @@ Twelve megabytes of four-column rows, all fields one width:
 
 | mean field bytes | scalar ms | simd ms | simd wins by |
 | ---: | ---: | ---: | ---: |
-| 2 | **8.4** | 9.5 | 0.88x |
-| 4 | 7.5 | **7.3** | 1.03x |
-| 8 | 6.9 | **5.3** | 1.30x |
-| 16 | 6.5 | **3.3** | 1.97x |
-| 32 | 6.4 | **2.4** | 2.67x |
-| 64 | 6.7 | **1.8** | 3.72x |
-| 128 | 6.7 | **1.6** | 4.19x |
-| 256 | 6.5 | **1.6** | 4.06x |
+| 2 | 6.9 | **6.7** | 1.03x |
+| 4 | 5.8 | **4.9** | 1.18x |
+| 8 | 6.1 | **3.4** | 1.79x |
+| 16 | 6.2 | **2.6** | 2.38x |
+| 32 | 6.1 | **1.5** | 4.07x |
+| 64 | 6.1 | **1.0** | 6.10x |
+| 128 | 6.4 | **0.7** | 9.14x |
+| 256 | 5.9 | **0.6** | 9.83x |
 
 The upstream README said SIMD tokenising was "about 20% faster". It is, for
-long fields, and by far more than 20%. For short ones it is slower, and both
-benchmark documents above are in that region.
+long fields, and by far more than 20%. For short ones it is a wash, and both
+benchmark documents above are in that region — where the scalar scan wins by
+about 4%.
 
 **Mean field length does not predict which wins**, which is why the choice is
-not made automatically. The sweep says SIMD is already ahead at 8-byte fields,
+not made automatically. The sweep says SIMD is well ahead at 8-byte fields,
 but both benchmark documents sit at 11-12 bytes per field and scalar wins
-there by 13-19%. Uniform fields are not the same shape as a real distribution
+there by 4%. Uniform fields are not the same shape as a real distribution
 with a median of 6 and a tail to 46, and until something predicts the real
 case, guessing on the caller's behalf would be worse than letting them
 measure. See [`docs/improvements.md`](docs/improvements.md).
@@ -171,10 +175,12 @@ measure. See [`docs/improvements.md`](docs/improvements.md).
 
 [simdcsv](https://github.com/geofflangdale/simdcsv) applies the simdjson
 techniques to RFC 4180, and on the same documents its structural scan finds
-exactly the same delimiters about **eleven times faster** — 11.1 GB/s against
-our 1.03. Half that gap is bookkeeping we could drop tomorrow and half is a
-scan built on tricks we would have to hand-roll in Mojo. Both are measured and
-written up in [`docs/improvements.md`](docs/improvements.md).
+exactly the same delimiters about **ten times faster** — 11.1 GB/s against our
+1.06. The index here has already been cut to one `UInt32` per field partly on
+the strength of that comparison, which bought 3-13% and a 4x reduction in
+index memory, rather than the 2x a first reading of the numbers suggested.
+What remains is the scan itself. Both are written up in
+[`docs/improvements.md`](docs/improvements.md).
 
 ## Development
 

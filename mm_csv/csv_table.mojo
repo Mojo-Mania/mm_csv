@@ -1,16 +1,21 @@
 """Reading CSV: tokenise once, then index.
 
 `CsvTable` takes the whole document as a `String` and makes one pass over it,
-recording where every field starts and ends. Nothing is copied and nothing is
-allocated per field. Reading a value afterwards is index arithmetic, and for
-the common case -- a field with no quotes in it -- handing back a `StringSlice`
-that borrows the original text.
+recording where every field ends. Nothing is copied and nothing is allocated
+per field. Reading a value afterwards is index arithmetic, and for the common
+case -- a field with no quotes in it -- handing back a `StringSlice` that
+borrows the original text.
+
+The index is **one** array of delimiter offsets, not two of starts and ends. A
+field's start is the previous delimiter plus one, and the CRLF adjustment is a
+byte compare when the field is read. Keeping both ends cost sixteen bytes per
+field and, measured, as much time again as the scan that filled them.
 
 The scan can be done two ways. `_scan_scalar` walks a byte at a time and is the
 definition of what the parser does. `_scan_simd` loads `simd_width_of[uint8]()`
 bytes at once, compares them against quote, separator and newline in parallel,
 and only visits the positions where something matched. Both produce the same
-index lists, which is what `test/test_csv.mojo` checks on every corpus.
+index, which is what `test/test_csv.mojo` checks on every corpus.
 
 Escaping follows RFC 4180: a field may be wrapped in double quotes, and inside
 such a field a literal double quote is written twice.
@@ -18,6 +23,7 @@ such a field a literal double quote is written twice.
 
 from std.math import iota
 from std.memory import stack_allocation
+from std.os import abort
 from std.sys.info import simd_width_of
 from std.sys.intrinsics import compressed_store
 
@@ -40,9 +46,17 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
     var _text: String
     """The document, owned. Every field is a slice of this."""
 
-    var _starts: List[Int]
-    var _ends: List[Int]
-    """Field boundaries, one entry per field, in document order."""
+    var _positions: List[UInt32]
+    """The offset of the delimiter that closed each field, in document order.
+
+    One entry per field, four bytes each, with the **top bit** set when that
+    delimiter was an LF preceded by a CR. Carrying the flag here rather than
+    re-reading two bytes at access time is what keeps reading as cheap as it
+    was when starts and ends were separate arrays; it is also what caps a
+    document at 2 GiB rather than 4."""
+
+    comptime _CRLF_BIT = UInt32(1) << 31
+    comptime _OFFSET_MASK = (UInt32(1) << 31) - 1
 
     var column_count: Int
     """Fields in the first row, which RFC 4180 says every row must match."""
@@ -57,32 +71,40 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                 reference implementation and exists to be compared against.
         """
         self._text = text^
-        self._starts = []
-        self._ends = []
+        self._positions = []
         self.column_count = 0
 
         var length = self._text.byte_length()
         if length == 0:
             return
+        # Written out rather than as `Int(UInt32.MAX)`, which wraps to -1 and
+        # would make this fire on every document.
+        comptime MAX_LENGTH = (1 << 31) - 1
+        if length > MAX_LENGTH:
+            abort(
+                "CsvTable indexes fields with 31 bits and cannot take a"
+                " document of 2 GiB or more"
+            )
 
-        self._starts.append(0)
+        # One allocation for the index, sized from the document. Eight bytes a
+        # field is a guess; being wrong costs a regrowth, not correctness.
+        self._positions.reserve(length // 8 + 16)
+
         var columns: Int
         if simd:
             columns = self._scan_simd(length)
         else:
             columns = self._scan_scalar(length, 0, False, -1)
 
-        # The scan leaves a dangling start after a final newline; otherwise the
-        # last field is still open and needs closing.
-        if self._text.unsafe_ptr()[unsafe_offset=length - 1] == LF:
-            _ = self._starts.pop()
-        else:
-            self._ends.append(length)
+        # A document not ending in a line break leaves its last field open, and
+        # the end of the text closes it.
+        if self._text.unsafe_ptr()[unsafe_offset=length - 1] != LF:
+            self._positions.append(UInt32(length))
 
         # A document with no line break at all is one row, and its column count
         # is however many fields it has. Leaving this at -1 is what made the
         # ported implementation's `row_count` divide by a negative number.
-        self.column_count = columns if columns > 0 else len(self._ends)
+        self.column_count = columns if columns > 0 else len(self._positions)
 
     def _scan_scalar(
         mut self,
@@ -91,7 +113,10 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
         var in_quotes: Bool,
         var columns: Int,
     ) -> Int:
-        """Walks bytes from `offset`, recording boundaries. Returns the column count.
+        """Walks bytes from `offset`, recording delimiters.
+
+        Returns:
+            The column count, or -1 if no line break was met.
         """
         var ptr = self._text.unsafe_ptr()
         while offset < length:
@@ -101,22 +126,22 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
             elif in_quotes:
                 pass
             elif byte == Self.separator:
-                self._ends.append(offset)
-                self._starts.append(offset + 1)
+                self._positions.append(UInt32(offset))
             elif byte == LF:
-                # A CRLF ends the field one byte earlier than the LF does.
-                var back = 1 if (
+                var flag = Self._CRLF_BIT if (
                     offset > 0 and ptr[unsafe_offset=offset - 1] == CR
-                ) else 0
-                self._ends.append(offset - back)
-                self._starts.append(offset + 1)
+                ) else UInt32(0)
+                self._positions.append(UInt32(offset) | flag)
                 if columns == -1:
-                    columns = len(self._ends)
+                    columns = len(self._positions)
             offset += 1
         return columns
 
     def _scan_simd(mut self, length: Int) -> Int:
         """Walks `WIDTH` bytes at a time, visiting only positions that matched.
+
+        Returns:
+            The column count, or -1 if no line break was met.
         """
         var ptr = self._text.unsafe_ptr()
         var quote_vec = SIMD[DType.uint8, WIDTH](QUOTE)
@@ -154,21 +179,20 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                         continue
                     if in_quotes:
                         continue
-                    var position = offset + lane
-                    var back = 0
+                    var flag = UInt32(0)
                     if line_feeds[lane]:
+                        var after_cr = previous_chunk_ended_on_cr
                         if lane > 0:
-                            back = Int(carriage_returns[lane - 1])
-                        else:
-                            back = Int(previous_chunk_ended_on_cr)
-                    self._ends.append(position - back)
-                    self._starts.append(position + 1)
-                    if columns == -1 and line_feeds[lane]:
-                        columns = len(self._ends)
+                            after_cr = Bool(carriage_returns[lane - 1])
+                        if after_cr:
+                            flag = Self._CRLF_BIT
+                        if columns == -1:
+                            columns = len(self._positions) + 1
+                    self._positions.append(UInt32(offset + lane) | flag)
 
             # Tracked for every chunk, matches or not: a CRLF straddling a
             # chunk boundary is only visible from here.
-            previous_chunk_ended_on_cr = carriage_returns[WIDTH - 1]
+            previous_chunk_ended_on_cr = Bool(carriage_returns[WIDTH - 1])
             offset += WIDTH
 
         return self._scan_scalar(length, offset, in_quotes, columns)
@@ -179,7 +203,7 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
         Returns:
             Every field in every row, including empty ones.
         """
-        return len(self._ends)
+        return len(self._positions)
 
     def row_count(self) -> Int:
         """Returns the number of rows.
@@ -189,7 +213,7 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
         """
         if self.column_count == 0:
             return 0
-        return len(self._ends) // self.column_count
+        return len(self._positions) // self.column_count
 
     def is_ragged(self) -> Bool:
         """Returns whether some row has a different field count from the first.
@@ -203,8 +227,8 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
             True if the field count is not a whole number of rows.
         """
         if self.column_count == 0:
-            return len(self._ends) != 0
-        return len(self._ends) % self.column_count != 0
+            return len(self._positions) != 0
+        return len(self._positions) % self.column_count != 0
 
     @always_inline
     def _index(self, row: Int, column: Int) raises -> Int:
@@ -214,9 +238,26 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                 "column ", column, " is outside 0..<", self.column_count
             )
         var index = row * self.column_count + column
-        if row < 0 or index >= len(self._ends):
+        if row < 0 or index >= len(self._positions):
             raise Error("row ", row, " is outside 0..<", self.row_count())
         return index
+
+    @always_inline
+    def _bounds(self, index: Int) -> Tuple[Int, Int]:
+        """Returns the half-open byte range of the field at `index`.
+
+        The start is the previous delimiter's offset plus one. The end is this
+        field's own delimiter, less its top bit, which the scan set when that
+        delimiter was an LF with a CR in front of it -- the CRLF that ends a
+        row is not part of the field.
+        """
+        var start = (
+            0 if index
+            == 0 else Int(self._positions[index - 1] & Self._OFFSET_MASK) + 1
+        )
+        var raw = self._positions[index]
+        var end = Int(raw & Self._OFFSET_MASK) - Int(raw >> 31)
+        return (start, end)
 
     def field[
         origin: ImmOrigin, //
@@ -242,14 +283,16 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
             The bytes between the delimiters, borrowed.
         """
         var index = self._index(row, column)
-        var start = self._starts[index]
+        var start: Int
+        var end: Int
+        start, end = self._bounds(index)
         var bytes = self._text.as_bytes()
         return StringSlice(
             unsafe_from_utf8=Span[UInt8, origin](
                 unsafe_ptr=bytes.unsafe_ptr()
                 .unsafe_offset(start)
                 .unsafe_origin_cast[origin](),
-                length=self._ends[index] - start,
+                length=end - start,
             )
         )
 
@@ -267,8 +310,9 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
             True if the raw field begins and ends with `"`.
         """
         var index = self._index(row, column)
-        var start = self._starts[index]
-        var end = self._ends[index]
+        var start: Int
+        var end: Int
+        start, end = self._bounds(index)
         if end - start < 2:
             return False
         var ptr = self._text.unsafe_ptr()
@@ -301,8 +345,11 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
             return String(self.field(row, column))
 
         var index = self._index(row, column)
-        var start = self._starts[index] + 1
-        var end = self._ends[index] - 1
+        var outer_start: Int
+        var outer_end: Int
+        outer_start, outer_end = self._bounds(index)
+        var start = outer_start + 1
+        var end = outer_end - 1
         var ptr = self._text.unsafe_ptr()
 
         var out = String()

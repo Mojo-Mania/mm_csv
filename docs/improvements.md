@@ -12,7 +12,8 @@ delimiters -- 2 042 888 in `no_escaping.csv`, matching commas plus line feeds
 | --- | ---: | ---: |
 | simdcsv, structural scan | **11.1 GB/s** | **12.5 GB/s** |
 | this, scan only, no storage | 2.09 GB/s | 2.11 GB/s |
-| this, full parse | 1.03 GB/s | 1.04 GB/s |
+| this, full parse, two `Int` lists | 1.03 GB/s | 1.04 GB/s |
+| this, full parse, one `UInt32` array | 1.06 GB/s | 1.06 GB/s |
 
 A caveat on that build: simdcsv's ARM path references `neonmovemask_bulk` and
 never defines it -- the README's promised ARM variant was never written -- so
@@ -20,21 +21,44 @@ these numbers come from the algorithm with that one function supplied (the
 standard simdjson movemask) and `vmull_p64`'s return cast. The C++ measured is
 theirs; the ARM completion is not.
 
-The gap splits in two, and the middle row above is what separates them.
+The gap looked like it split in two, and the first half turned out to be
+smaller than it looked.
 
-**Half of our parse is bookkeeping, not scanning.** Recording boundaries into
-two `List[Int]`s costs as much again as the byte walk that finds them: 16 bytes
-written per delimiter, with a capacity check each time, against simdcsv's four
-bytes into a preallocated array with no per-write check.
+## The index: done, and it taught a lesson about microbenchmarks
 
-*The fix:* keep **one** `UInt32` array of delimiter positions rather than two
-`Int` lists of starts and ends. A field's start is the previous delimiter's
-position plus one, and its end is its own delimiter's position, minus one when
-that delimiter is an LF preceded by a CR -- a single byte compare, payable at
-access time instead of at parse time. That is a 4x cut in index memory and it
-removes one append per field.
+Recording boundaries into two `List[Int]`s looked like half the cost of
+parsing: the same byte walk with the appends replaced by a counter ran at
+2.09 GB/s against the full parse's 1.03. **That reading was wrong**, and the
+note here used to predict "about 2x" from it.
 
-**The scan itself is 5.3x slower than their whole pass.** Three techniques
+The index is now one `List[UInt32]` of delimiter offsets, with the top bit
+flagging a delimiter that was an LF preceded by a CR, so a field's start comes
+from the previous entry and its end needs no byte compare. That is four bytes
+a field instead of sixteen. Measured:
+
+| | two `Int` lists | one `UInt32` array |
+| --- | ---: | ---: |
+| parse, `simd=True` | 852 MiB/s | **965 MiB/s** |
+| parse, `simd=False` | 977 MiB/s | **1009 MiB/s** |
+| read all, `field` | 6465 MiB/s | 6468 MiB/s |
+| read all, `get` | 872 MiB/s | 854 MiB/s |
+| index bytes per field | 16 | **4** |
+
+3-13% on parsing and a 4x cut in index memory, not 2x. Worth keeping, and
+worth far less than the microbenchmark implied.
+
+The lesson is about the measurement, not the change. "The same loop with the
+writes removed" is not the same loop: with nothing to store, everything stays
+in registers and the compiler is free to vectorise what it could not before.
+The 11 ms that disappeared was the writes *plus* the optimisations their
+absence allowed, and only the first part was recoverable.
+
+An intermediate version is also worth recording: keeping one array but
+recomputing the CRLF adjustment at read time, with two byte loads per field,
+cost 10-15% on reading and gave back most of the parse gain. Moving that one
+bit into the index is what made the change free on the read side.
+
+**The scan itself is 5.3x slower than their whole pass.****The scan itself is 5.3x slower than their whole pass.** Three techniques
 account for it:
 
 1. **64 bytes per step, as a bitmask.** They compare four 16-byte vectors and
@@ -57,9 +81,8 @@ a weight-multiply and pairwise adds. Carry-less multiply would need an
 `llvm_intrinsic` call per architecture, `pmull64` on ARM and `pclmulqdq` on
 x86, with a scalar fallback. Neither is out of reach; both are real work.
 
-*Order to do it in:* the storage change first. It is contained, needs no new
-primitives, and the measurement says it is worth about 2x on its own. The
-bitmask scan is the larger prize and the larger project.
+*What is left:* the storage change is done and bought 3-13%. Everything above
+is what remains, and it is now the whole of the gap rather than half of it.
 
 ## Choosing the scan automatically
 
