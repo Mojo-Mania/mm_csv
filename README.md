@@ -107,23 +107,23 @@ fraction and field-length distribution. It prints the shape it produced.
 
 | | ms | MiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| parse, `simd=True` | **8.2** | **2672** | **4.0** |
-| parse, `simd=False` | 21.6 | 1016 | 10.6 |
-| read all, `field` (slice) | **3.4** | **6421** | **1.7** |
-| read all, `get` (String) | 25.9 | 848 | 12.7 |
-| build, `escape=False` | **18.2** | **1206** | **8.9** |
-| build, `escape=True` | 32.3 | 681 | 15.8 |
+| parse, `simd=True` | **5.8** | **3789** | **2.8** |
+| parse, `simd=False` | 21.6 | 1019 | 10.6 |
+| read all, `field` (slice) | **3.4** | **6402** | **1.7** |
+| read all, `get` (String) | 25.6 | 858 | 12.5 |
+| build, `escape=False` | **19.8** | **1112** | **9.7** |
+| build, `escape=True` | 33.1 | 664 | 16.2 |
 
 **`needs_escaping.csv`** — 24.9 MB, 201 182 rows, 10 columns, 10% quoted:
 
 | | ms | MiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| parse, `simd=True` | **8.8** | **2700** | **4.4** |
-| parse, `simd=False` | 23.2 | 1022 | 11.5 |
-| read all, `field` (slice) | **3.3** | **7152** | **1.6** |
-| read all, `get` (String) | 35.1 | 676 | 17.5 |
-| build, `escape=False` | **19.5** | **1219** | **9.7** |
-| build, `escape=True` | 35.8 | 684 | 17.8 |
+| parse, `simd=True` | **6.0** | **3955** | **3.0** |
+| parse, `simd=False` | 23.5 | 1009 | 11.7 |
+| read all, `field` (slice) | **3.3** | **7197** | **1.6** |
+| read all, `get` (String) | 35.0 | 678 | 17.4 |
+| build, `escape=False` | **19.4** | **1222** | **9.7** |
+| build, `escape=True` | 36.0 | 680 | 17.9 |
 
 Two things to read off these.
 
@@ -153,41 +153,38 @@ It wins at every field width measured:
 
 | mean field bytes | scalar ms | simd ms | simd wins by |
 | ---: | ---: | ---: | ---: |
-| 2 | 7.0 | **4.5** | 1.56x |
-| 4 | 6.5 | **3.0** | 2.17x |
-| 8 | 5.2 | **2.4** | 2.17x |
-| 16 | 6.0 | **2.4** | 2.50x |
-| 32 | 6.1 | **2.4** | 2.54x |
-| 64 | 6.3 | **2.3** | 2.74x |
-| 128 | 6.7 | **1.4** | 4.79x |
-| 256 | 5.9 | **0.9** | 6.56x |
+| 2 | 6.8 | **3.5** | 1.94x |
+| 4 | 6.4 | **2.3** | 2.78x |
+| 8 | 6.1 | **1.6** | 3.81x |
+| 16 | 6.2 | **1.3** | 4.77x |
+| 32 | 6.2 | **1.3** | 4.77x |
+| 64 | 6.4 | **1.2** | 5.33x |
+| 128 | 6.3 | **1.1** | 5.73x |
+| 256 | 6.3 | **1.0** | 6.30x |
 
 That was not true of the first version of this scan, which looked at sixteen
 bytes and visited each match through a scratch buffer. It lost to the scalar
 walk on short fields — which is what both documents above have — and the
 upstream README's claim that SIMD tokenising was "about 20% faster" held only
-for long ones. Rewriting it as bitmask arithmetic made the parse **2.8x**
+for long ones. Rewriting it as bitmask arithmetic made the parse **3.9x**
 faster on those documents and turned a coin flip into a default worth having.
 
-One cost is worth knowing about. Packing sixteen lanes into sixteen bits is
-most of the work in a chunk, and Mojo has no movemask — `SIMD[bool, N].to_bits()`
-returns a lane-wise vector, not a packed integer — so it is done by shifting
-each lane by its own index and ORing. A chunk containing nothing at all skips
-that entirely, which is what keeps long-field documents fast, but a chunk with
-one delimiter in it pays the same as a chunk with thirty. See
-[`docs/improvements.md`](docs/improvements.md).
+The packing step is `pack_bits` from `std.memory`, which bitcasts a 64-lane
+`SIMD[bool, 64]` straight to a `UInt64`. It is worth naming because writing
+that by hand — shifting each lane by its own index and ORing — costs **1.4x**
+of the whole parse. See [`docs/improvements.md`](docs/improvements.md).
 
 ## How it compares
 
 [simdcsv](https://github.com/geofflangdale/simdcsv) applies the simdjson
 techniques to RFC 4180, and on the same documents its structural scan finds
-exactly the same delimiters about **four times faster** — 11.1 GB/s against
-our 2.7. Two of the three things it does differently have been adopted since
-that comparison: the index is one `UInt32` per field, and the scan is bitmask
-arithmetic over sixty-four bytes with a prefix-XOR for quotes. Together they
-took parsing from 0.85 to 2.7 GB/s. What is left is mostly that Mojo has no
-movemask instruction and no carry-less multiply, so both are emulated. Written
-up in [`docs/improvements.md`](docs/improvements.md).
+exactly the same delimiters about **three times faster** — 11.1 GB/s against
+our 4.0. Everything it does differently has now been adopted: the index is one
+`UInt32` per field, and the scan is bitmask arithmetic over sixty-four bytes
+with a prefix-XOR for quotes. Together those took parsing from 0.85 to
+4.0 GB/s, a **4.7x** improvement over the ported implementation. What is left
+is unaccounted for and written up in
+[`docs/improvements.md`](docs/improvements.md).
 
 ## Development
 

@@ -13,10 +13,10 @@ delimiters -- 2 042 888 in `no_escaping.csv`, matching commas plus line feeds
 | simdcsv, structural scan | **11.1 GB/s** | **12.5 GB/s** |
 | this, full parse, two `Int` lists, 16-byte scan | 0.89 GB/s | 0.87 GB/s |
 | this, one `UInt32` array, 16-byte scan | 1.01 GB/s | 0.95 GB/s |
-| this, one `UInt32` array, 64-byte bitmask scan | **2.80 GB/s** | **2.83 GB/s** |
+| this, one `UInt32` array, 64-byte bitmask scan | **3.97 GB/s** | **4.15 GB/s** |
 
-Two rounds of that list have now been done, and the gap is four times rather
-than eleven.
+Everything on that list has now been done, and the gap is about three times
+rather than eleven.
 
 A caveat on that build: simdcsv's ARM path references `neonmovemask_bulk` and
 never defines it -- the README's promised ARM variant was never written -- so
@@ -61,26 +61,44 @@ recomputing the CRLF adjustment at read time, with two byte loads per field,
 cost 10-15% on reading and gave back most of the parse gain. Moving that one
 bit into the index is what made the change free on the read side.
 
-## The scan: done, and what it left behind
+## The scan: done
 
 The scan is now the simdjson shape: sixty-four bytes a step, four `UInt64`
 bitmasks, a prefix-XOR for the quote regions, and a count-trailing-zeros walk
-over the delimiters that survive. Against the sixteen-byte
-`compressed_store` version it replaced:
+over the delimiters that survive. Against the sixteen-byte `compressed_store`
+version it replaced:
 
-| | 16-byte scan | 64-byte bitmask |
-| --- | ---: | ---: |
-| `no_escaping.csv` | 965 MiB/s | **2672 MiB/s** |
-| `needs_escaping.csv` | 908 MiB/s | **2700 MiB/s** |
+| | 16-byte scan | 64-byte, hand-rolled packing | 64-byte, `pack_bits` |
+| --- | ---: | ---: | ---: |
+| `no_escaping.csv` | 965 MiB/s | 2672 MiB/s | **3789 MiB/s** |
+| `needs_escaping.csv` | 908 MiB/s | 2700 MiB/s | **3955 MiB/s** |
 
-2.8x and 3.0x, and it turned the SIMD path from something that lost to the
-scalar walk on short fields into one that wins at every width measured.
+3.9x and 4.4x, and it turned the SIMD path from something that lost to the
+scalar walk on short fields into one that wins at every width measured, from
+1.94x at two-byte fields to 6.30x at 256.
 
-Two of the three techniques carried over cleanly. The third did not, and one
-of them needed help:
+### `pack_bits` is the movemask, and an earlier version of this note was wrong
 
-**Carry-less multiply: implemented, measured, and not kept.** `pclmulqdq` /
-`pmull64` computes the prefix-XOR in one instruction. Mojo can reach it --
+The middle column above exists because this file previously claimed **Mojo has
+no movemask**, on the grounds that `SIMD[bool, N].to_bits()` returns a
+lane-wise vector rather than a packed integer. That is true of `to_bits`, and
+it is the wrong function. `std.memory.pack_bits` is the right one: it bitcasts
+a `SIMD[bool, 64]` straight to a `UInt64`, one lane per bit, which is exactly
+the movemask.
+
+Replacing the hand-rolled packing -- shift each lane by its own index, OR the
+result -- with `pack_bits` is worth **1.42x and 1.46x** of the whole parse. It
+also collapses four 16-byte loads and sixteen packing sequences per chunk into
+one 64-byte load and four `pack_bits` calls.
+
+The lesson is about how the absence was concluded: one function was tried, it
+was not the one, and "Mojo cannot do this" went into three files. Searching the
+standard library would have cost a minute.
+
+### Carry-less multiply: implemented, measured, twice, and not kept
+
+`pclmulqdq` / `pmull64` computes the prefix-XOR in one instruction, and Mojo
+can reach it:
 
 ```mojo
 var product = llvm_intrinsic[
@@ -89,46 +107,28 @@ var product = llvm_intrinsic[
 return bitcast[DType.uint64, 2](product)[0]
 ```
 
--- and it agrees with the shift version on every input tried, including the
-all-ones and single-high-bit cases. It is genuinely faster per call:
+It agrees with the six shift-and-XOR steps on every input tried, including the
+all-ones and single-high-bit cases, and it is genuinely faster per call: 1.029
+ns against 1.119, which over a GiB of input saves about 1.5 ms.
 
-| | per call | a GiB of input | share of a GiB parse |
-| --- | ---: | ---: | ---: |
-| six shift-and-XOR steps | 1.119 ns | — | — |
-| `pmull64` | 1.029 ns | saves 1.5 ms | **0.4%** |
+That is under 1% of a parse, because one call covers sixty-four bytes and the
+rest of the chunk costs far more. End to end it measured 2693 against 2656
+MiB/s on the slower scan, and 3801 against 3796 after `pack_bits` made the
+rest of the chunk three times cheaper -- inside the run-to-run spread both
+times. The portable version stays.
 
-One call covers sixty-four bytes, so 0.09 ns of saving spread over 64 bytes is
-1.5 ms per GiB against a parse that takes about 400 ms. End to end the two
-versions measured 2693 against 2656 MiB/s, inside the run-to-run spread.
+It was re-measured the second time because an earlier version of this note
+promised the intrinsic was "worth revisiting only if the movemask cost comes
+down enough to make 0.4% matter", and then the movemask cost came down. The
+answer did not change.
 
-So the portable version stays, and now for a measured reason rather than an
-assumed one. An earlier version of this note said carry-less multiply "did not
-show up as a bottleneck" -- which was true, but nothing had been measured when
-it was written. The intrinsic is worth revisiting only if the movemask cost
-below comes down enough to make 0.4% matter.
+### The empty-chunk skip
 
-**The empty-chunk skip had to be added back.** The first bitmask version paid
-for sixteen movemasks on every chunk whether or not it held anything, which
-made it 3x *slower* than the old scan on documents with long fields — 2.0 ms
-against 0.6 at 256-byte fields. One comparison per class per vector, ORed and
-reduced to a single bool, answers "is there anything here?" without any
-packing; a chunk that is entirely inert skips the rest. That recovered the
-long-field case and improved everything else too.
-
-**The movemask is now the floor.** Mojo has no packed-lane movemask --
-`SIMD[bool, N].to_bits()` returns a lane-wise vector -- so sixteen lanes are
-packed into sixteen bits by shifting each lane by its own index and ORing,
-about ten operations where NEON's `vpaddq` sequence does sixty-four lanes in
-roughly eight. Four classes times four vectors is sixteen of those per chunk,
-and it is most of what a non-empty chunk costs: a chunk with one delimiter in
-it pays the same as a chunk with thirty. That is visible in the sweep, where
-everything between 16 and 64 byte fields sits at the same 2.4 ms.
-
-Worth trying, in order: the multiply-based bit gather
-(`(x & 0x8040201008040201) * 0x0101010101010101 >> 56` over a 0xFF-per-lane
-mask), which packs eight bytes in three integer operations and may beat the
-shift-and-OR; and failing that, an `llvm_intrinsic` movemask per architecture.
-Neither has been measured.
+The first bitmask version paid for its packing on every chunk whether or not
+it held anything, which made it 3x *slower* than the old scan on documents
+with long fields -- 2.0 ms against 0.6 at 256-byte fields. Testing the four
+masks for zero before doing anything else skips an inert chunk outright, and
+that is what makes the scan win at every width rather than only on dense data.
 
 ## Choosing the scan automatically
 

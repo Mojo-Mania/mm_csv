@@ -23,6 +23,7 @@ such a field a literal double quote is written twice.
 
 from std.bit import count_trailing_zeros, pop_count
 from std.math import iota
+from std.memory import pack_bits
 from std.os import abort
 from std.sys.info import simd_width_of
 
@@ -31,27 +32,13 @@ comptime LF = UInt8(ord("\n"))
 comptime CR = UInt8(ord("\r"))
 comptime COMMA = UInt8(ord(","))
 
-comptime LANES = 16
-"""Bytes in one vector compare."""
-
 comptime CHUNK = 64
-"""Bytes the SIMD scan looks at per step: four vectors, one `UInt64` of flags
-per character class. Sixty-four is not an arbitrary number -- it is the width
-of the integer that carries those flags, and the reason the whole quote
-analysis fits in ordinary register arithmetic."""
+"""Bytes the SIMD scan looks at per step.
 
-
-@always_inline
-def _movemask(mask: SIMD[DType.bool, LANES]) -> UInt64:
-    """Packs sixteen lane flags into the low sixteen bits of an integer.
-
-    Every SIMD lane becomes one bit. Mojo has no movemask -- `to_bits()`
-    returns a lane-wise vector, not a packed integer -- so this shifts each
-    lane left by its own index and ORs the result together.
-    """
-    var lanes = mask.cast[DType.uint16]()
-    var shifts = iota[DType.uint16, LANES]()
-    return UInt64((lanes << shifts).reduce_or())
+Sixty-four is not an arbitrary number: it is the width of the integer that
+carries one flag per byte, which is what lets the whole quote analysis happen
+in ordinary register arithmetic. `pack_bits` turns a 64-lane comparison into
+that integer directly."""
 
 
 @always_inline
@@ -66,10 +53,11 @@ def _prefix_xor(var bits: UInt64) -> UInt64:
     `pclmulqdq` on x86, `pmull64` on ARM -- which is how simdjson and simdcsv
     do it. Mojo can reach it: `llvm_intrinsic["llvm.aarch64.neon.pmull64",
     SIMD[DType.uint8, 16]]` compiles and agrees with this function on every
-    input tested. It is measurably faster per call -- 1.03 ns against 1.12 --
-    and worth **0.4%** of a parse, because one call covers sixty-four bytes
-    and the rest of the chunk costs far more. Six portable shift-and-XOR steps
-    it is, then. See `docs/improvements.md`.
+    input tested. It is faster per call -- 1.03 ns against 1.12 -- and worth
+    under 1% of a parse, because one call covers sixty-four bytes and the rest
+    of the chunk costs far more. Measured again after `pack_bits` made the
+    rest of the chunk three times cheaper, and it was still under 1%. Six
+    portable shift-and-XOR steps it is. See `docs/improvements.md`.
     """
     bits ^= bits << 1
     bits ^= bits << 2
@@ -202,10 +190,10 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
             The column count, or -1 if no line break was met.
         """
         var ptr = self._text.unsafe_ptr()
-        var quote_v = SIMD[DType.uint8, LANES](QUOTE)
-        var sep_v = SIMD[DType.uint8, LANES](Self.separator)
-        var lf_v = SIMD[DType.uint8, LANES](LF)
-        var cr_v = SIMD[DType.uint8, LANES](CR)
+        var quote_v = SIMD[DType.uint8, CHUNK](QUOTE)
+        var sep_v = SIMD[DType.uint8, CHUNK](Self.separator)
+        var lf_v = SIMD[DType.uint8, CHUNK](LF)
+        var cr_v = SIMD[DType.uint8, CHUNK](CR)
 
         # All ones while the scan is inside a quoted region, all zeros outside.
         var carried_quote = UInt64(0)
@@ -215,54 +203,21 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
         var offset = 0
 
         while offset + CHUNK <= length:
-            var v0 = ptr.unsafe_offset(offset).unsafe_load[width=LANES]()
-            var v1 = ptr.unsafe_offset(offset + 16).unsafe_load[width=LANES]()
-            var v2 = ptr.unsafe_offset(offset + 32).unsafe_load[width=LANES]()
-            var v3 = ptr.unsafe_offset(offset + 48).unsafe_load[width=LANES]()
+            var block = ptr.unsafe_offset(offset).unsafe_load[width=CHUNK]()
 
-            # Packing sixteen lanes into bits is most of the cost of a
-            # chunk, and a chunk with nothing in it needs none of it. One
-            # comparison per class per vector answers "is there anything
-            # here?" without any packing, and on data with long fields --
-            # where delimiters are far apart -- that skips nearly every
-            # chunk. Safe only when the chunk is entirely inert: no quote to
-            # change the carried state, and no carriage return to pair with a
-            # line feed in the next one.
-            var present = (
-                (v0.eq(quote_v) | v0.eq(sep_v) | v0.eq(lf_v) | v0.eq(cr_v))
-                | (v1.eq(quote_v) | v1.eq(sep_v) | v1.eq(lf_v) | v1.eq(cr_v))
-                | (v2.eq(quote_v) | v2.eq(sep_v) | v2.eq(lf_v) | v2.eq(cr_v))
-                | (v3.eq(quote_v) | v3.eq(sep_v) | v3.eq(lf_v) | v3.eq(cr_v))
-            )
-            if not present.reduce_or():
+            var quotes = pack_bits[DType.uint64](block.eq(quote_v))
+            var separators = pack_bits[DType.uint64](block.eq(sep_v))
+            var line_feeds = pack_bits[DType.uint64](block.eq(lf_v))
+            var carriage_returns = pack_bits[DType.uint64](block.eq(cr_v))
+
+            if (
+                quotes | separators | line_feeds | carriage_returns
+            ) == 0 and carried_quote == 0:
+                # Nothing structural in these sixty-four bytes and no quote
+                # state to carry, so there is nothing to do with them.
                 carried_cr = 0
                 offset += CHUNK
                 continue
-
-            var quotes = (
-                _movemask(v0.eq(quote_v))
-                | (_movemask(v1.eq(quote_v)) << 16)
-                | (_movemask(v2.eq(quote_v)) << 32)
-                | (_movemask(v3.eq(quote_v)) << 48)
-            )
-            var separators = (
-                _movemask(v0.eq(sep_v))
-                | (_movemask(v1.eq(sep_v)) << 16)
-                | (_movemask(v2.eq(sep_v)) << 32)
-                | (_movemask(v3.eq(sep_v)) << 48)
-            )
-            var line_feeds = (
-                _movemask(v0.eq(lf_v))
-                | (_movemask(v1.eq(lf_v)) << 16)
-                | (_movemask(v2.eq(lf_v)) << 32)
-                | (_movemask(v3.eq(lf_v)) << 48)
-            )
-            var carriage_returns = (
-                _movemask(v0.eq(cr_v))
-                | (_movemask(v1.eq(cr_v)) << 16)
-                | (_movemask(v2.eq(cr_v)) << 32)
-                | (_movemask(v3.eq(cr_v)) << 48)
-            )
 
             var inside = _prefix_xor(quotes) ^ carried_quote
             # Sign-extending bit 63 carries the state into the next chunk.
