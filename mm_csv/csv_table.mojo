@@ -57,13 +57,17 @@ def _prefix_xor(var bits: UInt64) -> UInt64:
 
     A carry-less multiply by all-ones does this in a single instruction --
     `pclmulqdq` on x86, `pmull64` on ARM -- which is how simdjson and simdcsv
-    do it. Mojo can reach it: `llvm_intrinsic["llvm.aarch64.neon.pmull64",
-    SIMD[DType.uint8, 16]]` compiles and agrees with this function on every
-    input tested. It is faster per call -- 1.03 ns against 1.12 -- and worth
-    under 1% of a parse, because one call covers sixty-four bytes and the rest
-    of the chunk costs far more. Measured again after `pack_bits` made the
-    rest of the chunk three times cheaper, and it was still under 1%. Six
-    portable shift-and-XOR steps it is. See `docs/improvements.md`.
+    do it. Mojo reaches it through `llvm_intrinsic`, it agrees with this
+    function on every input tried, and on this machine it is **slower**. The
+    disassembly says why: these six steps compile to six `eor` instructions
+    with a free shifted operand, all in general-purpose registers, while
+    `pmull64` needs an `fmov` into the vector file and another back out --
+    `pack_bits` leaves the mask in a general-purpose register. Two
+    register-file crossings cost more than six ALU ops.
+
+    An isolated microbenchmark said the opposite, and was wrong: what an
+    operation costs depends on where its operand already lives, which is a
+    property of the surrounding code. See `docs/improvements.md`.
     """
     bits ^= bits << 1
     bits ^= bits << 2

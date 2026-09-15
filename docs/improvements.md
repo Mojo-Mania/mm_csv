@@ -96,10 +96,10 @@ The lesson is about how the absence was concluded: one function was tried, it
 was not the one, and "Mojo cannot do this" went into three files. Searching the
 standard library would have cost a minute.
 
-### Carry-less multiply: implemented, measured, twice, and not kept
+### Carry-less multiply: measured three times, and it is slower
 
 `pclmulqdq` / `pmull64` computes the prefix-XOR in one instruction, and Mojo
-can reach it:
+reaches it:
 
 ```mojo
 var product = llvm_intrinsic[
@@ -108,20 +108,51 @@ var product = llvm_intrinsic[
 return bitcast[DType.uint64, 2](product)[0]
 ```
 
-It agrees with the six shift-and-XOR steps on every input tried, including the
-all-ones and single-high-bit cases, and it is genuinely faster per call: 1.029
-ns against 1.119, which over a GiB of input saves about 1.5 ms.
+It agrees with the six shift-and-XOR steps on every input tried. It is also
+**slower in this scan**, consistently: two binaries, alternated, each taking
+the best of 400 parses of the same document.
 
-That is under 1% of a parse, because one call covers sixty-four bytes and the
-rest of the chunk costs far more. End to end it measured 2693 against 2656
-MiB/s on the slower scan, and 3801 against 3796 after `pack_bits` made the
-rest of the chunk three times cheaper -- inside the run-to-run spread both
-times. The portable version stays.
+| | best of 400 parses, microseconds |
+| --- | --- |
+| six shift-and-XOR steps | 3611, 3615, 3616, 3618, 3621, 3621, 3626, 3630 |
+| `pmull64` | 3637, 3643, 3644, 3645, 3650, 3650, 3667, 3692 |
 
-It was re-measured the second time because an earlier version of this note
-promised the intrinsic was "worth revisiting only if the movemask cost comes
-down enough to make 0.4% matter", and then the movemask cost came down. The
-answer did not change.
+Eight pairs, shift ahead in all eight, by about 0.8%.
+
+The disassembly says why. The portable version is six instructions and no
+moves, because ARM gives the shifted operand away for free:
+
+```
+eor x9, x9, x9, lsl #1
+eor x9, x9, x9, lsl #2
+eor x9, x9, x9, lsl #4
+eor x9, x9, x9, lsl #8
+eor x9, x9, x9, lsl #16
+eor x8, x8, x9, lsl #32
+```
+
+The intrinsic is one instruction bracketed by two register-file crossings,
+because `pack_bits` leaves the mask in a general-purpose register and
+`pmull64` wants a vector one:
+
+```
+fmov  d4, x9          ; general-purpose -> vector
+pmull.1q v4, v4, v9
+fmov  x9, d4          ; vector -> general-purpose
+```
+
+**An isolated microbenchmark got this backwards.** Timed on its own with a
+random feed, `pmull64` measured 1.029 ns a call against the shift version's
+1.119, and this note reported it as "faster per call, but under 1% of a
+parse". The per-call number was real and the conclusion drawn from it was
+wrong: what an operation costs depends on which register file its operand
+already lives in, and that is a property of the code around it, not of the
+operation. Only the in-place A/B answered it.
+
+So the portable version stays, now on the grounds that it is both portable and
+faster. On x86, where `pclmulqdq` takes its operands from the vector file that
+`pack_bits` would already be using, the answer could easily differ; nothing
+here has been measured on x86.
 
 ### The empty-chunk skip
 
@@ -186,9 +217,9 @@ that this does not:
 
 The profile also says the mask arithmetic -- prefix-XOR, the CRLF shift, the
 `& ~inside` -- is now the largest single phase at 1.90 ms of 5.60. That is
-where a fourth round would start, and it is the part where carry-less multiply
-would help if anything does; it was worth under 1% when measured twice, but
-both measurements were taken when the walk still dominated.
+where a fourth round would start. Carry-less multiply is not the answer there:
+re-measured once the walk stopped dominating, it is slower, for the reason
+above.
 
 ## Choosing the scan automatically
 
