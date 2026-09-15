@@ -37,10 +37,10 @@ no streaming reader here.
 nothing. `is_quoted` tells you whether the difference matters for a given
 field.
 
-**The SIMD scan is not always faster** — see [below](#which-scan). It wins by
-up to 4x on documents with long fields and loses by 10-20% on documents with
-short ones. It is the default because the downside is small and the upside is
-not, but if you are parsing one shape of document repeatedly, measure.
+**Leave the SIMD scan on.** It is the default and it wins at every field width
+measured, by 1.6x on two-byte fields and 6.6x on 256-byte ones. The scalar walk
+is kept as the reference implementation the tests compare against, not as an
+option you are meant to need.
 
 **Documents must be under 2 GiB.** Field positions are indexed with 31 bits
 and a flag; a larger document aborts with a message saying so.
@@ -107,23 +107,23 @@ fraction and field-length distribution. It prints the shape it produced.
 
 | | ms | MiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| parse, `simd=True` | 22.8 | 965 | 11.2 |
-| parse, `simd=False` | **21.8** | **1009** | **10.7** |
-| read all, `field` (slice) | **3.4** | **6468** | **1.7** |
-| read all, `get` (String) | 25.7 | 854 | 12.6 |
-| build, `escape=False` | **19.1** | **1151** | **9.3** |
-| build, `escape=True` | 32.1 | 686 | 15.7 |
+| parse, `simd=True` | **8.2** | **2672** | **4.0** |
+| parse, `simd=False` | 21.6 | 1016 | 10.6 |
+| read all, `field` (slice) | **3.4** | **6421** | **1.7** |
+| read all, `get` (String) | 25.9 | 848 | 12.7 |
+| build, `escape=False` | **18.2** | **1206** | **8.9** |
+| build, `escape=True` | 32.3 | 681 | 15.8 |
 
 **`needs_escaping.csv`** — 24.9 MB, 201 182 rows, 10 columns, 10% quoted:
 
 | | ms | MiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| parse, `simd=True` | 26.1 | 908 | 13.0 |
-| parse, `simd=False` | **23.6** | **1008** | **11.7** |
-| read all, `field` (slice) | **3.3** | **7106** | **1.7** |
-| read all, `get` (String) | 34.7 | 684 | 17.2 |
-| build, `escape=False` | **20.0** | **1186** | **9.9** |
-| build, `escape=True` | 35.5 | 690 | 17.7 |
+| parse, `simd=True` | **8.8** | **2700** | **4.4** |
+| parse, `simd=False` | 23.2 | 1022 | 11.5 |
+| read all, `field` (slice) | **3.3** | **7152** | **1.6** |
+| read all, `get` (String) | 35.1 | 676 | 17.5 |
+| build, `escape=False` | **19.5** | **1219** | **9.7** |
+| build, `escape=True` | 35.8 | 684 | 17.8 |
 
 Two things to read off these.
 
@@ -139,48 +139,55 @@ the tail.
 
 ### Which scan
 
-The vectorised scan reads `simd_width_of[uint8]()` bytes at a time — 16 with
-NEON — and compares them against quote, separator and newline in parallel. But
-it then has to visit every delimiter it found. When fields are short there is
-a delimiter every few bytes, that visiting dominates, and the vector work buys
-nothing.
+The vectorised scan turns sixty-four bytes at a time into four `UInt64`s --
+one bit per byte, for quote, separator, line feed and carriage return -- and
+then does the whole job in integer arithmetic. A prefix-XOR of the quote bits
+gives a mask of every byte inside a quoted region, so `& ~quotes` deletes the
+delimiters that are data rather than structure, with no branch per quote and
+no state machine. Shifting the carriage returns left by one lines them up with
+the line feeds that follow, so one AND finds the CRLF row ends. What is left
+is walked with count-trailing-zeros, once per delimiter rather than once per
+byte.
 
-Twelve megabytes of four-column rows, all fields one width:
+It wins at every field width measured:
 
 | mean field bytes | scalar ms | simd ms | simd wins by |
 | ---: | ---: | ---: | ---: |
-| 2 | 6.9 | **6.7** | 1.03x |
-| 4 | 5.8 | **4.9** | 1.18x |
-| 8 | 6.1 | **3.4** | 1.79x |
-| 16 | 6.2 | **2.6** | 2.38x |
-| 32 | 6.1 | **1.5** | 4.07x |
-| 64 | 6.1 | **1.0** | 6.10x |
-| 128 | 6.4 | **0.7** | 9.14x |
-| 256 | 5.9 | **0.6** | 9.83x |
+| 2 | 7.0 | **4.5** | 1.56x |
+| 4 | 6.5 | **3.0** | 2.17x |
+| 8 | 5.2 | **2.4** | 2.17x |
+| 16 | 6.0 | **2.4** | 2.50x |
+| 32 | 6.1 | **2.4** | 2.54x |
+| 64 | 6.3 | **2.3** | 2.74x |
+| 128 | 6.7 | **1.4** | 4.79x |
+| 256 | 5.9 | **0.9** | 6.56x |
 
-The upstream README said SIMD tokenising was "about 20% faster". It is, for
-long fields, and by far more than 20%. For short ones it is a wash, and both
-benchmark documents above are in that region — where the scalar scan wins by
-about 4%.
+That was not true of the first version of this scan, which looked at sixteen
+bytes and visited each match through a scratch buffer. It lost to the scalar
+walk on short fields — which is what both documents above have — and the
+upstream README's claim that SIMD tokenising was "about 20% faster" held only
+for long ones. Rewriting it as bitmask arithmetic made the parse **2.8x**
+faster on those documents and turned a coin flip into a default worth having.
 
-**Mean field length does not predict which wins**, which is why the choice is
-not made automatically. The sweep says SIMD is well ahead at 8-byte fields,
-but both benchmark documents sit at 11-12 bytes per field and scalar wins
-there by 4%. Uniform fields are not the same shape as a real distribution
-with a median of 6 and a tail to 46, and until something predicts the real
-case, guessing on the caller's behalf would be worse than letting them
-measure. See [`docs/improvements.md`](docs/improvements.md).
+One cost is worth knowing about. Packing sixteen lanes into sixteen bits is
+most of the work in a chunk, and Mojo has no movemask — `SIMD[bool, N].to_bits()`
+returns a lane-wise vector, not a packed integer — so it is done by shifting
+each lane by its own index and ORing. A chunk containing nothing at all skips
+that entirely, which is what keeps long-field documents fast, but a chunk with
+one delimiter in it pays the same as a chunk with thirty. See
+[`docs/improvements.md`](docs/improvements.md).
 
 ## How it compares
 
 [simdcsv](https://github.com/geofflangdale/simdcsv) applies the simdjson
 techniques to RFC 4180, and on the same documents its structural scan finds
-exactly the same delimiters about **ten times faster** — 11.1 GB/s against our
-1.06. The index here has already been cut to one `UInt32` per field partly on
-the strength of that comparison, which bought 3-13% and a 4x reduction in
-index memory, rather than the 2x a first reading of the numbers suggested.
-What remains is the scan itself. Both are written up in
-[`docs/improvements.md`](docs/improvements.md).
+exactly the same delimiters about **four times faster** — 11.1 GB/s against
+our 2.7. Two of the three things it does differently have been adopted since
+that comparison: the index is one `UInt32` per field, and the scan is bitmask
+arithmetic over sixty-four bytes with a prefix-XOR for quotes. Together they
+took parsing from 0.85 to 2.7 GB/s. What is left is mostly that Mojo has no
+movemask instruction and no carry-less multiply, so both are emulated. Written
+up in [`docs/improvements.md`](docs/improvements.md).
 
 ## Development
 

@@ -11,9 +11,12 @@ delimiters -- 2 042 888 in `no_escaping.csv`, matching commas plus line feeds
 | | `no_escaping.csv` | `needs_escaping.csv` |
 | --- | ---: | ---: |
 | simdcsv, structural scan | **11.1 GB/s** | **12.5 GB/s** |
-| this, scan only, no storage | 2.09 GB/s | 2.11 GB/s |
-| this, full parse, two `Int` lists | 1.03 GB/s | 1.04 GB/s |
-| this, full parse, one `UInt32` array | 1.06 GB/s | 1.06 GB/s |
+| this, full parse, two `Int` lists, 16-byte scan | 0.89 GB/s | 0.87 GB/s |
+| this, one `UInt32` array, 16-byte scan | 1.01 GB/s | 0.95 GB/s |
+| this, one `UInt32` array, 64-byte bitmask scan | **2.80 GB/s** | **2.83 GB/s** |
+
+Two rounds of that list have now been done, and the gap is four times rather
+than eleven.
 
 A caveat on that build: simdcsv's ARM path references `neonmovemask_bulk` and
 never defines it -- the README's promised ARM variant was never written -- so
@@ -58,31 +61,74 @@ recomputing the CRLF adjustment at read time, with two byte loads per field,
 cost 10-15% on reading and gave back most of the parse gain. Moving that one
 bit into the index is what made the change free on the read side.
 
-**The scan itself is 5.3x slower than their whole pass.****The scan itself is 5.3x slower than their whole pass.** Three techniques
-account for it:
+## The scan: done, and what it left behind
 
-1. **64 bytes per step, as a bitmask.** They compare four 16-byte vectors and
-   pack the results into one `UInt64` with a movemask, then walk the set bits
-   with count-trailing-zeros. We look at 16 bytes and then visit each match
-   through `compressed_store` and a runtime lane index.
-2. **Carry-less multiply for the quote mask.** `vmull_p64(-1, quote_bits)` is a
-   prefix-XOR: it turns "here are the quote positions" into "here is every
-   position inside a quoted region", for all 64 bytes, branchlessly. Delimiters
-   inside quotes then vanish with one `& ~quote_mask`. We toggle a boolean per
-   quote in a loop, which is a branch per quote and a dependency chain.
-3. **Unrolled bits-to-indexes.** `flatten_bits` writes eight indexes per
-   iteration with no per-bit branch, deliberately overrunning the count into a
-   padded buffer.
+The scan is now the simdjson shape: sixty-four bytes a step, four `UInt64`
+bitmasks, a prefix-XOR for the quote regions, and a count-trailing-zeros walk
+over the delimiters that survive. Against the sixteen-byte
+`compressed_store` version it replaced:
 
-*What Mojo gives us today:* `count_trailing_zeros` and `pop_count` are there.
-A SIMD-to-bitmask movemask is **not** -- `SIMD[bool, N].to_bits()` returns a
-lane-wise 0/1 vector, not a packed integer -- so it would have to be built from
-a weight-multiply and pairwise adds. Carry-less multiply would need an
-`llvm_intrinsic` call per architecture, `pmull64` on ARM and `pclmulqdq` on
-x86, with a scalar fallback. Neither is out of reach; both are real work.
+| | 16-byte scan | 64-byte bitmask |
+| --- | ---: | ---: |
+| `no_escaping.csv` | 965 MiB/s | **2672 MiB/s** |
+| `needs_escaping.csv` | 908 MiB/s | **2700 MiB/s** |
 
-*What is left:* the storage change is done and bought 3-13%. Everything above
-is what remains, and it is now the whole of the gap rather than half of it.
+2.8x and 3.0x, and it turned the SIMD path from something that lost to the
+scalar walk on short fields into one that wins at every width measured.
+
+Two of the three techniques carried over cleanly. The third did not, and one
+of them needed help:
+
+**Carry-less multiply: implemented, measured, and not kept.** `pclmulqdq` /
+`pmull64` computes the prefix-XOR in one instruction. Mojo can reach it --
+
+```mojo
+var product = llvm_intrinsic[
+    "llvm.aarch64.neon.pmull64", SIMD[DType.uint8, 16]
+](bits, UInt64.MAX)
+return bitcast[DType.uint64, 2](product)[0]
+```
+
+-- and it agrees with the shift version on every input tried, including the
+all-ones and single-high-bit cases. It is genuinely faster per call:
+
+| | per call | a GiB of input | share of a GiB parse |
+| --- | ---: | ---: | ---: |
+| six shift-and-XOR steps | 1.119 ns | — | — |
+| `pmull64` | 1.029 ns | saves 1.5 ms | **0.4%** |
+
+One call covers sixty-four bytes, so 0.09 ns of saving spread over 64 bytes is
+1.5 ms per GiB against a parse that takes about 400 ms. End to end the two
+versions measured 2693 against 2656 MiB/s, inside the run-to-run spread.
+
+So the portable version stays, and now for a measured reason rather than an
+assumed one. An earlier version of this note said carry-less multiply "did not
+show up as a bottleneck" -- which was true, but nothing had been measured when
+it was written. The intrinsic is worth revisiting only if the movemask cost
+below comes down enough to make 0.4% matter.
+
+**The empty-chunk skip had to be added back.** The first bitmask version paid
+for sixteen movemasks on every chunk whether or not it held anything, which
+made it 3x *slower* than the old scan on documents with long fields — 2.0 ms
+against 0.6 at 256-byte fields. One comparison per class per vector, ORed and
+reduced to a single bool, answers "is there anything here?" without any
+packing; a chunk that is entirely inert skips the rest. That recovered the
+long-field case and improved everything else too.
+
+**The movemask is now the floor.** Mojo has no packed-lane movemask --
+`SIMD[bool, N].to_bits()` returns a lane-wise vector -- so sixteen lanes are
+packed into sixteen bits by shifting each lane by its own index and ORing,
+about ten operations where NEON's `vpaddq` sequence does sixty-four lanes in
+roughly eight. Four classes times four vectors is sixteen of those per chunk,
+and it is most of what a non-empty chunk costs: a chunk with one delimiter in
+it pays the same as a chunk with thirty. That is visible in the sweep, where
+everything between 16 and 64 byte fields sits at the same 2.4 ms.
+
+Worth trying, in order: the multiply-based bit gather
+(`(x & 0x8040201008040201) * 0x0101010101010101 >> 56` over a 0xFF-per-lane
+mask), which packs eight bytes in three integer operations and may beat the
+shift-and-OR; and failing that, an `llvm_intrinsic` movemask per architecture.
+Neither has been measured.
 
 ## Choosing the scan automatically
 
