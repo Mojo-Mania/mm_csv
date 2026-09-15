@@ -13,10 +13,11 @@ delimiters -- 2 042 888 in `no_escaping.csv`, matching commas plus line feeds
 | simdcsv, structural scan | **11.1 GB/s** | **12.5 GB/s** |
 | this, full parse, two `Int` lists, 16-byte scan | 0.89 GB/s | 0.87 GB/s |
 | this, one `UInt32` array, 16-byte scan | 1.01 GB/s | 0.95 GB/s |
-| this, one `UInt32` array, 64-byte bitmask scan | **3.97 GB/s** | **4.15 GB/s** |
+| this, 64-byte bitmask scan | 3.97 GB/s | 4.15 GB/s |
+| this, plus an unrolled delimiter walk | **6.07 GB/s** | **6.55 GB/s** |
 
-Everything on that list has now been done, and the gap is about three times
-rather than eleven.
+Everything on that list has now been done, and the gap is about 1.8x rather
+than eleven.
 
 A caveat on that build: simdcsv's ARM path references `neonmovemask_bulk` and
 never defines it -- the README's promised ARM variant was never written -- so
@@ -129,6 +130,65 @@ it held anything, which made it 3x *slower* than the old scan on documents
 with long fields -- 2.0 ms against 0.6 at 256-byte fields. Testing the four
 masks for zero before doing anything else skips an inert chunk outright, and
 that is what makes the scan win at every width rather than only on dense data.
+
+### The profile, and the unrolled walk it argued for
+
+Building the scan up a phase at a time over the real file -- adding work
+rather than stubbing it out, so no phase changes what the data is -- put the
+time here, on `no_escaping.csv`:
+
+| phase | cumulative | added |
+| --- | ---: | ---: |
+| load 64 bytes | 0.20 ms | 0.20 |
+| + four compares, four `pack_bits` | 0.98 ms | 0.78 |
+| + quote, CRLF and delimiter masks | 2.88 ms | 1.90 |
+| + walk the delimiter bits | 5.48 ms | **2.60** |
+| + store into the index | 5.60 ms | 0.12 |
+
+Loads were 3% and stores 2%; the walk over the delimiter bits was **46%**.
+That loop was `while bits != 0: ctz, write, clear lowest bit` -- a branch per
+delimiter, 2.04 million of them. Unrolling it into groups of eight, writing
+past the count into slack the way simdcsv does, dropped that phase from
+2.60 ms to 0.57 ms and the whole parse from 3789 to 5854 MiB/s: **1.5x**.
+
+Two things about doing it are worth recording.
+
+*A nested closure destroyed it.* The first attempt put the eight-wide body in
+a `@parameter def` so it could be called four times. Capturing the mutable
+`bits` and destination pointer forced them to memory, and the whole scan went
+**three times slower** than before the change. Written out inline, the same
+logic is 1.5x faster. Same algorithm, 4.7x apart.
+
+*It needed storage this package owns.* Writing past the count means the index
+cannot be a `List` -- `append` will not overrun and there is no public way to
+set a length after writing through `unsafe_ptr`. `_positions` is now a raw
+allocation with an explicit count and capacity, and the scan checks once per
+chunk that sixty-four more entries will fit.
+
+That check was not there at first, and the benchmark crashed: the index is
+sized at one entry per eight bytes, and a document of two-byte fields has a
+delimiter every three, so the unrolled writes ran off the end of the
+allocation. Nothing in the test suite was dense enough to catch it.
+`test_far_more_delimiters_than_the_index_was_sized_for` is, and it crashes if
+the check is removed.
+
+### What is left
+
+simdcsv is still about 1.8x ahead, 11.1 GB/s against 6.1. Three things it does
+that this does not:
+
+- **Buffering.** It processes four chunks into a small array of masks before
+  flattening any of them, for pipelining, and reports that as its single
+  biggest win after the bitmask work itself.
+- **Prefetching.** `__builtin_prefetch(buf + idx + 128)` on every chunk.
+- **No capacity check at all.** Its index buffer is padded once at the start
+  and the scan never checks, where this one checks per chunk.
+
+The profile also says the mask arithmetic -- prefix-XOR, the CRLF shift, the
+`& ~inside` -- is now the largest single phase at 1.90 ms of 5.60. That is
+where a fourth round would start, and it is the part where carry-less multiply
+would help if anything does; it was worth under 1% when measured twice, but
+both measurements were taken when the walk still dominated.
 
 ## Choosing the scan automatically
 

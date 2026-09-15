@@ -107,23 +107,23 @@ fraction and field-length distribution. It prints the shape it produced.
 
 | | ms | MiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| parse, `simd=True` | **5.8** | **3789** | **2.8** |
-| parse, `simd=False` | 21.6 | 1019 | 10.6 |
-| read all, `field` (slice) | **3.4** | **6402** | **1.7** |
-| read all, `get` (String) | 25.6 | 858 | 12.5 |
-| build, `escape=False` | **19.8** | **1112** | **9.7** |
-| build, `escape=True` | 33.1 | 664 | 16.2 |
+| parse, `simd=True` | **3.8** | **5854** | **1.8** |
+| parse, `simd=False` | 21.8 | 1010 | 10.7 |
+| read all, `field` (slice) | **3.5** | **6221** | **1.7** |
+| read all, `get` (String) | 26.4 | 831 | 12.9 |
+| build, `escape=False` | **19.2** | **1146** | **9.4** |
+| build, `escape=True` | 32.0 | 687 | 15.7 |
 
 **`needs_escaping.csv`** — 24.9 MB, 201 182 rows, 10 columns, 10% quoted:
 
 | | ms | MiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| parse, `simd=True` | **6.0** | **3955** | **3.0** |
-| parse, `simd=False` | 23.5 | 1009 | 11.7 |
-| read all, `field` (slice) | **3.3** | **7197** | **1.6** |
-| read all, `get` (String) | 35.0 | 678 | 17.4 |
-| build, `escape=False` | **19.4** | **1222** | **9.7** |
-| build, `escape=True` | 36.0 | 680 | 17.9 |
+| parse, `simd=True` | **3.8** | **6284** | **1.9** |
+| parse, `simd=False` | 22.7 | 1044 | 11.3 |
+| read all, `field` (slice) | **3.4** | **6946** | **1.7** |
+| read all, `get` (String) | 35.5 | 669 | 17.6 |
+| build, `escape=False` | **19.8** | **1198** | **9.8** |
+| build, `escape=True` | 36.6 | 670 | 18.2 |
 
 Two things to read off these.
 
@@ -153,14 +153,14 @@ It wins at every field width measured:
 
 | mean field bytes | scalar ms | simd ms | simd wins by |
 | ---: | ---: | ---: | ---: |
-| 2 | 6.8 | **3.5** | 1.94x |
-| 4 | 6.4 | **2.3** | 2.78x |
-| 8 | 6.1 | **1.6** | 3.81x |
-| 16 | 6.2 | **1.3** | 4.77x |
-| 32 | 6.2 | **1.3** | 4.77x |
-| 64 | 6.4 | **1.2** | 5.33x |
-| 128 | 6.3 | **1.1** | 5.73x |
-| 256 | 6.3 | **1.0** | 6.30x |
+| 2 | 7.0 | **5.0** | 1.40x |
+| 4 | 6.1 | **2.6** | 2.35x |
+| 8 | 6.2 | **1.8** | 3.44x |
+| 16 | 6.2 | **1.8** | 3.44x |
+| 32 | 6.1 | **1.9** | 3.21x |
+| 64 | 6.5 | **1.8** | 3.61x |
+| 128 | 6.6 | **1.2** | 5.50x |
+| 256 | 6.4 | **0.9** | 7.11x |
 
 That was not true of the first version of this scan, which looked at sixteen
 bytes and visited each match through a scratch buffer. It lost to the scalar
@@ -169,27 +169,29 @@ upstream README's claim that SIMD tokenising was "about 20% faster" held only
 for long ones. Rewriting it as bitmask arithmetic made the parse **3.9x**
 faster on those documents and turned a coin flip into a default worth having.
 
-The packing step is `pack_bits` from `std.memory`, which bitcasts a 64-lane
-`SIMD[bool, 64]` straight to a `UInt64`. It is worth naming because writing
-that by hand — shifting each lane by its own index and ORing — costs **1.4x**
-of the whole parse. See [`docs/improvements.md`](docs/improvements.md).
+Two parts of it are worth naming. The packing step is `pack_bits` from
+`std.memory`, which bitcasts a 64-lane `SIMD[bool, 64]` straight to a
+`UInt64`; writing that by hand costs **1.4x** of the whole parse. And the walk
+over the delimiter bits is unrolled into groups of eight, which a profile said
+was worth another **1.5x** — it was nearly half the scan, most of that a
+branch per delimiter. See [`docs/improvements.md`](docs/improvements.md).
 
 ## How it compares
 
 [simdcsv](https://github.com/geofflangdale/simdcsv) applies the simdjson
 techniques to RFC 4180, and on the same documents its structural scan finds
-exactly the same delimiters about **three times faster** — 11.1 GB/s against
-our 4.0. Everything it does differently has now been adopted: the index is one
-`UInt32` per field, and the scan is bitmask arithmetic over sixty-four bytes
-with a prefix-XOR for quotes. Together those took parsing from 0.85 to
-4.0 GB/s, a **4.7x** improvement over the ported implementation. What is left
-is unaccounted for and written up in
+exactly the same delimiters about **twice as fast** — 11.1 GB/s against our
+6.1. Everything it does differently has now been adopted: one `UInt32` per
+field for the index, bitmask arithmetic over sixty-four bytes with a
+prefix-XOR for quotes, and an unrolled walk over the delimiter bits. Together
+those took parsing from 0.85 to 6.1 GB/s, a **7.2x** improvement over the
+ported implementation. Where the remaining 1.8x goes is in
 [`docs/improvements.md`](docs/improvements.md).
 
 ## Development
 
 ```bash
-pixi run test      # the test suite (20 tests)
+pixi run test      # the test suite (21 tests)
 pixi run main      # the example
 pixi run bench     # the tables above -- needs `bash data/setup.sh` first
 pixi run format    # mojo format

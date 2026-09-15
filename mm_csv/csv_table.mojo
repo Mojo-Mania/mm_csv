@@ -24,6 +24,8 @@ such a field a literal double quote is written twice.
 from std.bit import count_trailing_zeros, pop_count
 from std.math import iota
 from std.memory import pack_bits
+from std.memory import unsafe_memcpy
+from std.memory.alloc import Allocation, alloc, dealloc
 from std.os import abort
 from std.sys.info import simd_width_of
 
@@ -31,6 +33,10 @@ comptime QUOTE = UInt8(ord('"'))
 comptime LF = UInt8(ord("\n"))
 comptime CR = UInt8(ord("\r"))
 comptime COMMA = UInt8(ord(","))
+
+comptime _SLACK = 128
+"""Spare entries the index keeps past its count, so the unrolled writes can
+overrun a chunk's worth without a check per delimiter."""
 
 comptime CHUNK = 64
 """Bytes the SIMD scan looks at per step.
@@ -78,14 +84,20 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
     var _text: String
     """The document, owned. Every field is a slice of this."""
 
-    var _positions: List[UInt32]
+    var _slots: Pointer[UInt32, MutUntrackedOrigin]
+    var _count: Int
+    var _capacity: Int
     """The offset of the delimiter that closed each field, in document order.
 
     One entry per field, four bytes each, with the **top bit** set when that
     delimiter was an LF preceded by a CR. Carrying the flag here rather than
     re-reading two bytes at access time is what keeps reading as cheap as it
     was when starts and ends were separate arrays; it is also what caps a
-    document at 2 GiB rather than 4."""
+    document at 2 GiB rather than 4.
+
+    Owned outright rather than held in a `List`, because the scan writes into
+    it through a raw pointer in unrolled groups of eight -- deliberately past
+    the count, into slack it has to guarantee itself."""
 
     comptime _CRLF_BIT = UInt32(1) << 31
     comptime _OFFSET_MASK = (UInt32(1) << 31) - 1
@@ -103,7 +115,9 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                 reference implementation and exists to be compared against.
         """
         self._text = text^
-        self._positions = []
+        self._capacity = _SLACK
+        self._count = 0
+        self._slots = alloc[UInt32]({count = _SLACK}).unsafe_leak()
         self.column_count = 0
 
         var length = self._text.byte_length()
@@ -118,9 +132,10 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                 " document of 2 GiB or more"
             )
 
-        # One allocation for the index, sized from the document. Eight bytes a
-        # field is a guess; being wrong costs a regrowth, not correctness.
-        self._positions.reserve(length // 8 + 16)
+        # One allocation for the index, sized from the document. Eight bytes
+        # a field is only a guess -- two-byte fields need four times that --
+        # so the scan checks before every chunk and grows if it has to.
+        self._reserve(length // 8 + _SLACK)
 
         var columns: Int
         if simd:
@@ -131,12 +146,46 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
         # A document not ending in a line break leaves its last field open, and
         # the end of the text closes it.
         if self._text.unsafe_ptr()[unsafe_offset=length - 1] != LF:
-            self._positions.append(UInt32(length))
+            self._push(UInt32(length))
 
         # A document with no line break at all is one row, and its column count
         # is however many fields it has. Leaving this at -1 is what made the
         # ported implementation's `row_count` divide by a negative number.
-        self.column_count = columns if columns > 0 else len(self._positions)
+        self.column_count = columns if columns > 0 else self._count
+
+    def __deinit__(deinit self):
+        """Frees the index."""
+        dealloc(
+            Allocation(
+                unsafe_owned_ptr=self._slots, layout={count = self._capacity}
+            )
+        )
+
+    def _reserve(mut self, needed: Int):
+        """Makes room for at least `needed` entries, keeping what is there."""
+        if needed <= self._capacity:
+            return
+        var capacity = self._capacity * 2
+        if capacity < needed:
+            capacity = needed
+        var slots = alloc[UInt32]({count = capacity}).unsafe_leak()
+        if self._count != 0:
+            unsafe_memcpy(dest=slots, src=self._slots, count=self._count)
+        dealloc(
+            Allocation(
+                unsafe_owned_ptr=self._slots, layout={count = self._capacity}
+            )
+        )
+        self._slots = slots
+        self._capacity = capacity
+
+    @always_inline
+    def _push(mut self, value: UInt32):
+        """Appends one entry, growing if it has to."""
+        if self._count == self._capacity:
+            self._reserve(self._capacity * 2 + _SLACK)
+        self._slots[unsafe_offset=self._count] = value
+        self._count += 1
 
     def _scan_scalar(
         mut self,
@@ -158,14 +207,14 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
             elif in_quotes:
                 pass
             elif byte == Self.separator:
-                self._positions.append(UInt32(offset))
+                self._push(UInt32(offset))
             elif byte == LF:
                 var flag = Self._CRLF_BIT if (
                     offset > 0 and ptr[unsafe_offset=offset - 1] == CR
                 ) else UInt32(0)
-                self._positions.append(UInt32(offset) | flag)
+                self._push(UInt32(offset) | flag)
                 if columns == -1:
-                    columns = len(self._positions)
+                    columns = self._count
             offset += 1
         return columns
 
@@ -201,6 +250,7 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
         var carried_cr = UInt64(0)
         var columns = -1
         var offset = 0
+        var written = 0
 
         while offset + CHUNK <= length:
             var block = ptr.unsafe_offset(offset).unsafe_load[width=CHUNK]()
@@ -240,21 +290,70 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                             UInt64.MAX if lane
                             == 63 else (UInt64(1) << UInt64(lane + 1)) - 1
                         )
-                        columns = len(self._positions) + Int(
-                            pop_count(delimiters & upto)
-                        )
+                        columns = written + Int(pop_count(delimiters & upto))
 
+                # Up to sixty-four delimiters can come out of one chunk,
+                # and the writes below run past the count on purpose, so the
+                # slack has to be there before any of them happen. One check
+                # per chunk, not one per delimiter.
+                if written + _SLACK > self._capacity:
+                    self._count = written
+                    self._reserve(self._capacity * 2 + _SLACK)
+
+                # Unrolled. The profile said this loop was nearly half the
+                # scan, most of it a branch per delimiter; groups of eight
+                # replace up to sixty-four of those branches with three.
+                # Written out rather than put in a nested closure: a closure
+                # capturing `bits` forced it to memory and made the whole scan
+                # three times slower.
+                var found = Int(pop_count(delimiters))
                 var bits = delimiters
-                while bits != 0:
-                    var lane = Int(count_trailing_zeros(bits))
-                    var flag = Self._CRLF_BIT if (
-                        crlf >> UInt64(lane)
+                comptime for j in range(0, 8):
+                    var lane0 = Int(count_trailing_zeros(bits))
+                    var flag0 = Self._CRLF_BIT if (
+                        crlf >> UInt64(lane0)
                     ) & 1 != 0 else UInt32(0)
-                    self._positions.append(UInt32(offset + lane) | flag)
+                    self._slots[unsafe_offset=written + j] = (
+                        UInt32(offset + lane0) | flag0
+                    )
                     bits &= bits - 1
+                if found > 8:
+                    comptime for j in range(8, 16):
+                        var lane8 = Int(count_trailing_zeros(bits))
+                        var flag8 = Self._CRLF_BIT if (
+                            crlf >> UInt64(lane8)
+                        ) & 1 != 0 else UInt32(0)
+                        self._slots[unsafe_offset=written + j] = (
+                            UInt32(offset + lane8) | flag8
+                        )
+                        bits &= bits - 1
+                if found > 16:
+                    comptime for j in range(16, 32):
+                        var lane16 = Int(count_trailing_zeros(bits))
+                        var flag16 = Self._CRLF_BIT if (
+                            crlf >> UInt64(lane16)
+                        ) & 1 != 0 else UInt32(0)
+                        self._slots[unsafe_offset=written + j] = (
+                            UInt32(offset + lane16) | flag16
+                        )
+                        bits &= bits - 1
+                if found > 32:
+                    comptime for j in range(32, 64):
+                        var lane32 = Int(count_trailing_zeros(bits))
+                        var flag32 = Self._CRLF_BIT if (
+                            crlf >> UInt64(lane32)
+                        ) & 1 != 0 else UInt32(0)
+                        self._slots[unsafe_offset=written + j] = (
+                            UInt32(offset + lane32) | flag32
+                        )
+                        bits &= bits - 1
+                written += found
 
             offset += CHUNK
 
+        # The unrolled writes went through the pointer, so the count has to
+        # be brought back into the struct before anything reads it.
+        self._count = written
         return self._scan_scalar(length, offset, carried_quote != 0, columns)
 
     def __len__(self) -> Int:
@@ -263,7 +362,7 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
         Returns:
             Every field in every row, including empty ones.
         """
-        return len(self._positions)
+        return self._count
 
     def row_count(self) -> Int:
         """Returns the number of rows.
@@ -273,7 +372,7 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
         """
         if self.column_count == 0:
             return 0
-        return len(self._positions) // self.column_count
+        return self._count // self.column_count
 
     def is_ragged(self) -> Bool:
         """Returns whether some row has a different field count from the first.
@@ -287,8 +386,8 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
             True if the field count is not a whole number of rows.
         """
         if self.column_count == 0:
-            return len(self._positions) != 0
-        return len(self._positions) % self.column_count != 0
+            return self._count != 0
+        return self._count % self.column_count != 0
 
     @always_inline
     def _index(self, row: Int, column: Int) raises -> Int:
@@ -298,7 +397,7 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                 "column ", column, " is outside 0..<", self.column_count
             )
         var index = row * self.column_count + column
-        if row < 0 or index >= len(self._positions):
+        if row < 0 or index >= self._count:
             raise Error("row ", row, " is outside 0..<", self.row_count())
         return index
 
@@ -313,9 +412,12 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
         """
         var start = (
             0 if index
-            == 0 else Int(self._positions[index - 1] & Self._OFFSET_MASK) + 1
+            == 0 else Int(
+                self._slots[unsafe_offset=index - 1] & Self._OFFSET_MASK
+            )
+            + 1
         )
-        var raw = self._positions[index]
+        var raw = self._slots[unsafe_offset=index]
         var end = Int(raw & Self._OFFSET_MASK) - Int(raw >> 31)
         return (start, end)
 

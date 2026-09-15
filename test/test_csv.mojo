@@ -263,6 +263,35 @@ def test_builder_buffer_boundaries() raises:
         )
 
 
+def test_far_more_delimiters_than_the_index_was_sized_for() raises:
+    """Regression: the index is sized from the document, and can be wrong.
+
+    The scan reserves one entry per eight bytes and then writes through a raw
+    pointer in unrolled groups, past the count, into slack. A document of
+    two-byte fields has a delimiter every three bytes -- four times the guess
+    -- so without a per-chunk capacity check the writes run off the end of the
+    allocation. That crashed, and only on documents denser than the estimate,
+    which none of the other tests are.
+    """
+    var text = String()
+    for _ in range(20000):
+        text += "ab,ab,ab,ab\r\n"
+    var table = CsvTable(text^)
+    assert_equal(table.column_count, 4, "columns")
+    assert_equal(table.row_count(), 20000, "rows")
+    assert_equal(len(table), 80000, "fields")
+    assert_equal(table.get(19999, 3), "ab", "last field")
+
+    # And the other way: one enormous field, far fewer delimiters than the
+    # estimate, so the index is mostly slack.
+    var wide = String()
+    for _ in range(50000):
+        wide += "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    var sparse = CsvTable(String(wide, ",b\r\n"))
+    assert_equal(sparse.column_count, 2, "sparse columns")
+    assert_equal(sparse.get(0, 1), "b", "sparse second field")
+
+
 def test_round_trip() raises:
     """Anything written must read back as what went in."""
     var awkward: List[String] = [
