@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          cache: true
+
+      - name: Run tests
+        run: pixi run test
+
+      - name: Run the example
+        run: pixi run main
+
+  lint:
+    name: format and docstrings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          cache: true
+
+      - name: Check formatting
+        run: |
+          pixi run format
+          git diff --exit-code
+
+      - name: Check docstrings
+        run: pixi run docs
+
+  bench:
+    name: benchmarks compile and run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          cache: true
+
+      # Timings from a shared runner are not comparable across runs; this
+      # only proves the benchmark builds and completes. The data it reads is
+      # generated rather than committed, so the job builds it first.
+      - name: Build the benchmark data
+        run: bash data/setup.sh
+
+      - name: Run benchmarks
+        run: pixi run bench
+
+  build:
+    name: build package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          # The pixi-build-mojo backend speaks pixi-build-api-version 7, which
+          # needs pixi >= 0.80. An older pixi does not fail on the version --
+          # it silently falls back to a 2025 backend that calls the removed
+          # `mojo package -o *.mojopkg`.
+          pixi-version: v0.80.0
+          cache: true
+
+      - name: Build the conda package
+        run: pixi build
+
+      - name: Check a package was produced
+        shell: bash
+        run: |
+          shopt -s nullglob
+          pkgs=(./*.conda)
+          if [ ${#pkgs[@]} -eq 0 ]; then
+            echo "pixi build produced no .conda package" >&2
+            exit 1
+          fi
+          ls -lh "${pkgs[@]}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mm_csv-${{ matrix.os }}
+          path: ./*.conda
+          if-no-files-found: error

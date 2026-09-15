@@ -1,0 +1,16 @@
+# Pixi
+.pixi/
+
+# Mojo build artifacts
+*.mojopkg
+*.mojoc
+.mojo_cache/
+
+# pixi build output
+*.conda
+
+# benchmark binaries
+/bench
+
+# macOS
+.DS_Store
