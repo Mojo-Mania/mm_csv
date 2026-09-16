@@ -117,8 +117,18 @@ def _prefix_xor(var bits: UInt64) -> UInt64:
     to six `eor`s. With the `addp` fold in `_movemask` the mask is already in
     a vector register, there is no `fmov` in, and it wins by 13%. The shifts
     are the fallback where there is no NEON. See `docs/improvements.md`.
+
+    `PMULL` sits behind AArch64's `aes` feature, and NEON being available does
+    not imply it. `CompilationTarget.has_neon()` answers True for any Apple
+    silicon target whether or not the feature is enabled, so asking it alone
+    emitted an intrinsic the backend could not select: `LLVM ERROR: Cannot
+    select: v16i8 = AArch64ISD::PMULL`, which aborts the compiler rather than
+    failing the build cleanly. CI hit it on a macOS runner while this machine,
+    where the feature is on, was fine. `--target-features=-aes` reproduces it.
     """
-    comptime if CompilationTarget.has_neon():
+    comptime if (
+        CompilationTarget.has_neon() and CompilationTarget._has_feature["aes"]()
+    ):
         # `_movemask` leaves the mask in a vector register, so this takes it
         # straight from there: one crossing on the way out, no `fmov` in.
         var product = llvm_intrinsic[
