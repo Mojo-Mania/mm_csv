@@ -1,6 +1,6 @@
 """Reading and writing CSV."""
 
-from mm_csv import CsvBuilder, CsvTable
+from mm_csv import CsvBuilder, CsvFields, CsvTable
 
 
 def writing() raises:
@@ -57,6 +57,20 @@ def reading() raises:
         print("  out of range raises:", error)
 
 
+def streaming() raises:
+    print("\n--- streaming ---")
+    # No index is built. The fields arrive once, in order, each saying
+    # whether it closed a row. Slower than indexing -- see the README -- but
+    # it costs no memory beyond the document itself.
+    var document = String("a,b,c\r\nd,e,f\r\n")
+    var row = String()
+    for field in CsvFields(document):
+        row += String(field.value, " ")
+        if field.ends_row:
+            print("  row:", row)
+            row = String()
+
+
 def tab_separated() raises:
     print("\n--- a different separator ---")
     var table = CsvTable[UInt8(ord("\t"))](String("a\tb\r\nc\td\r\n"))
@@ -66,4 +80,5 @@ def tab_separated() raises:
 def main() raises:
     writing()
     reading()
+    streaming()
     tab_separated()

@@ -7,7 +7,7 @@ scalar one. And regressions for the three bugs the ported implementation had,
 each written so it fails if the fix is taken out.
 """
 
-from mm_csv import CsvBuilder, CsvTable
+from mm_csv import CsvBuilder, CsvFields, CsvTable
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
 
@@ -158,11 +158,22 @@ def test_scan_paths_agree_across_chunk_boundaries() raises:
     the previous chunk ended on a CR. Padding the first field to every length
     in a wide range walks the CRLF across every lane of that boundary.
     """
-    for pad in range(0, 200):
+    # The tail matters as much as the padding. A CR at the last byte of a
+    # chunk only reaches the carry if the LF after it is in another *full*
+    # chunk; with a short document the scalar tail picks it up instead and
+    # the carry is never exercised. Every one of these documents keeps two
+    # hundred bytes of rows after the boundary. Verified by deleting
+    # `carried_cr = carriage_returns >> 63`, which this catches and the
+    # shorter documents this test used to build did not.
+    var trailer = String("")
+    for _ in range(20):
+        trailer += "c,d\r\n"
+
+    for pad in range(0, 130):
         var filler = String("")
         for _ in range(pad):
             filler += "x"
-        var text = String(filler, ",b\r\nc,d\r\n")
+        var text = String(filler, ",b\r\n", trailer)
         var simd_fields = _fields(text, True)
         var scalar_fields = _fields(text, False)
         assert_equal(
@@ -379,6 +390,121 @@ def test_custom_separator() raises:
         'x\t"has\ttab"\r\n',
         "tab writer quotes its own separator",
     )
+
+
+# ===-----------------------------------------------------------------------===#
+# Streaming
+# ===-----------------------------------------------------------------------===#
+
+
+def _assert_streams_like_the_table(text: String, context: String) raises:
+    """`CsvFields` must find the same fields, in order, as `CsvTable`.
+
+    The two walk the same chunks with the same bitmask arithmetic but keep
+    none of it in the same place, and the arithmetic is written out twice
+    because sharing it cost 11% of the parse. This is what stops the two
+    copies drifting apart, so it runs over every document the other tests
+    use.
+    """
+    var table = CsvTable(text)
+    var index = 0
+    for field in CsvFields(text):
+        assert_true(
+            index < len(table), String(context, ": field ", index, " is extra")
+        )
+        var row = index // table.column_count
+        var column = index % table.column_count
+        assert_equal(
+            String(field.value),
+            String(table.field(row, column)),
+            String(context, ": raw field ", index),
+        )
+        assert_equal(
+            field.unescaped(),
+            table.get(row, column),
+            String(context, ": unescaped field ", index),
+        )
+        # The last field of the document always closes a row, whether or
+        # not the document is a whole number of rows -- which the generated
+        # documents below deliberately are not.
+        assert_equal(
+            field.ends_row,
+            column == table.column_count - 1 or index == len(table) - 1,
+            String(context, ": ends_row on field ", index),
+        )
+        index += 1
+    assert_equal(index, len(table), String(context, ": field count"))
+
+
+def test_streaming_matches_the_table() raises:
+    _assert_streams_like_the_table(
+        "aaa,bbb,ccc\r\nzzz,yyy,xxx\r\n", "CRLF rows"
+    )
+    _assert_streams_like_the_table(
+        "aaa,bbb,ccc\r\nzzz,yyy,xxx", "no trailing break"
+    )
+    _assert_streams_like_the_table("a,b\nc,d\n", "bare LF")
+    _assert_streams_like_the_table('a,"b,c",d\r\n', "separator inside quotes")
+    _assert_streams_like_the_table(
+        'a,"line\r\nbreak",c\r\n', "break inside quotes"
+    )
+    _assert_streams_like_the_table('a,"he said ""hi""",c\r\n', "doubled quote")
+    _assert_streams_like_the_table(",,\r\n,,\r\n", "empty fields")
+    _assert_streams_like_the_table("é,ü\r\nnaïve,日本\r\n", "non-ASCII")
+
+
+def test_streaming_an_empty_document() raises:
+    var count = 0
+    for _ in CsvFields(String("")):
+        count += 1
+    assert_equal(count, 0, "an empty document has no fields")
+
+
+def test_streaming_across_chunk_boundaries() raises:
+    """The CRLF and in-quotes carries have to survive a chunk boundary here
+    too, and the iterator keeps them somewhere else than the table does.
+
+    Same trailer as `test_scan_paths_agree_across_chunk_boundaries`, and for
+    the same reason: without a full chunk after the boundary the scalar tail
+    handles the CRLF and the carry is never tested.
+    """
+    var trailer = String("")
+    var wide_trailer = String("")
+    for _ in range(20):
+        trailer += "c,d\r\n"
+        wide_trailer += "e,f,g\r\n"
+
+    for pad in range(0, 130):
+        var filler = String("")
+        for _ in range(pad):
+            filler += "x"
+        _assert_streams_like_the_table(
+            String(filler, ",b\r\n", trailer), String("CRLF pad ", pad)
+        )
+        var quoted = String(
+            'a,"', filler, ',still one field",c\r\n', wide_trailer
+        )
+        _assert_streams_like_the_table(quoted, String("quote pad ", pad))
+
+
+def test_streaming_a_custom_separator() raises:
+    var text = String("a\tb\r\nc\td\r\n")
+    var got = List[String]()
+    for field in CsvFields[separator=UInt8(ord("\t"))](text):
+        got.append(String(field.value))
+    assert_equal(len(got), 4, "tab separated field count")
+    assert_equal(got[2], "c", "tab separated value")
+
+
+def test_streaming_reads_a_document_of_every_length() raises:
+    """Every chunk-boundary alignment of the tail, which is walked scalar."""
+    var text = String("")
+    for i in range(150):
+        var document = String(text, "z")
+        _assert_streams_like_the_table(
+            document, String("length ", document.byte_length())
+        )
+        text += "a,b\r\n" if i % 7 == 6 else "q"
 
 
 def main() raises:
