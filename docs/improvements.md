@@ -14,10 +14,11 @@ delimiters -- 2 042 888 in `no_escaping.csv`, matching commas plus line feeds
 | this, full parse, two `Int` lists, 16-byte scan | 0.89 GB/s | 0.87 GB/s |
 | this, one `UInt32` array, 16-byte scan | 1.01 GB/s | 0.95 GB/s |
 | this, 64-byte bitmask scan | 3.97 GB/s | 4.15 GB/s |
-| this, plus an unrolled delimiter walk | **6.07 GB/s** | **6.55 GB/s** |
+| this, plus an unrolled delimiter walk | 6.07 GB/s | 6.55 GB/s |
+| this, plus a bulk movemask and `pmull64` | **9.61 GB/s** | **10.37 GB/s** |
 
-Everything on that list has now been done, and the gap is about 1.8x rather
-than eleven.
+Everything on that list has been done, and profiling then found three things
+it does not do. The gap is 1.16x rather than eleven.
 
 A caveat on that build: simdcsv's ARM path references `neonmovemask_bulk` and
 never defines it -- the README's promised ARM variant was never written -- so
@@ -78,81 +79,72 @@ version it replaced:
 scalar walk on short fields into one that wins at every width measured, from
 1.94x at two-byte fields to 6.30x at 256.
 
-### `pack_bits` is the movemask, and an earlier version of this note was wrong
+### `pack_bits` is the movemask, and then it was not fast enough
 
-The middle column above exists because this file previously claimed **Mojo has
-no movemask**, on the grounds that `SIMD[bool, N].to_bits()` returns a
-lane-wise vector rather than a packed integer. That is true of `to_bits`, and
-it is the wrong function. `std.memory.pack_bits` is the right one: it bitcasts
-a `SIMD[bool, 64]` straight to a `UInt64`, one lane per bit, which is exactly
-the movemask.
+An earlier version of this note claimed **Mojo has no movemask**, on the
+grounds that `SIMD[bool, N].to_bits()` returns a lane-wise vector rather than a
+packed integer. That is true of `to_bits` and it is the wrong function:
+`std.memory.pack_bits` bitcasts a `SIMD[bool, 64]` straight to a `UInt64`.
+Using it instead of a hand-rolled shift-and-OR was worth 1.42x. One function
+had been tried, it was not the one, and "Mojo cannot do this" went into three
+files; searching the standard library would have cost a minute.
 
-Replacing the hand-rolled packing -- shift each lane by its own index, OR the
-result -- with `pack_bits` is worth **1.42x and 1.46x** of the whole parse. It
-also collapses four 16-byte loads and sixteen packing sequences per chunk into
-one 64-byte load and four `pack_bits` calls.
-
-The lesson is about how the absence was concluded: one function was tried, it
-was not the one, and "Mojo cannot do this" went into three files. Searching the
-standard library would have cost a minute.
-
-### Carry-less multiply: measured three times, and it is slower
-
-`pclmulqdq` / `pmull64` computes the prefix-XOR in one instruction, and Mojo
-reaches it:
-
-```mojo
-var product = llvm_intrinsic[
-    "llvm.aarch64.neon.pmull64", SIMD[DType.uint8, 16]
-](bits, UInt64.MAX)
-return bitcast[DType.uint64, 2](product)[0]
-```
-
-It agrees with the six shift-and-XOR steps on every input tried. It is also
-**slower in this scan**, consistently: two binaries, alternated, each taking
-the best of 400 parses of the same document.
-
-| | best of 400 parses, microseconds |
-| --- | --- |
-| six shift-and-XOR steps | 3611, 3615, 3616, 3618, 3621, 3621, 3626, 3630 |
-| `pmull64` | 3637, 3643, 3644, 3645, 3650, 3650, 3667, 3692 |
-
-Eight pairs, shift ahead in all eight, by about 0.8%.
-
-The disassembly says why. The portable version is six instructions and no
-moves, because ARM gives the shifted operand away for free:
+It is still not what the disassembly wants. On ARM, `pack_bits` over 64 lanes
+lowers to four independent sixteen-lane movemasks:
 
 ```
-eor x9, x9, x9, lsl #1
-eor x9, x9, x9, lsl #2
-eor x9, x9, x9, lsl #4
-eor x9, x9, x9, lsl #8
-eor x9, x9, x9, lsl #16
-eor x8, x8, x9, lsl #32
+and.16b  v17, v17, v29     ; weights
+addp.16b v17, v17, v17     ; three pairwise folds, 16 bytes -> 2
+addp.16b v17, v17, v17
+addp.16b v17, v17, v17
+umov.h   w10, v17[0]       ; a crossing out of the vector file
 ```
 
-The intrinsic is one instruction bracketed by two register-file crossings,
-because `pack_bits` leaves the mask in a general-purpose register and
-`pmull64` wants a vector one:
+Four of those per mask, four masks per chunk: **sixteen crossings and about
+ninety instructions** to pack one chunk. simdjson's `neonmovemask_bulk` folds
+all four vectors together first -- four `and`, four `addp`, **one** `umov` --
+and `llvm_intrinsic["llvm.aarch64.neon.addp", ...]` reaches the instruction it
+needs. Over the whole binary that took `umov` from 23 to 3 and the parse from
+5854 to 8101 MiB/s, **1.40x**.
+
+### Carry-less multiply: three verdicts, all of them correct
+
+`pmull64` computes the prefix-XOR in one instruction. Whether to use it got
+measured three times and the answer changed twice, because the answer was
+never a property of the instruction.
+
+| measured | verdict | why |
+| --- | --- | --- |
+| in isolation, random feed | 1.029 ns against 1.119, **faster** | nothing around it to say where the operand lives |
+| in the scan, with `pack_bits` | 0.8% **slower**, 8 pairs of 8 | mask lands in a general-purpose register, so `fmov` in *and* out |
+| in the scan, with the `addp` fold | 13% **faster**, 6 pairs of 6 | mask is already in a vector register, so only `fmov` out |
+
+The disassembly of the last one:
 
 ```
-fmov  d4, x9          ; general-purpose -> vector
+pmull.1q v0, v0, v9      ; operand already in v0, no fmov in
+fmov     x10, d0         ; one crossing out
+eor      x8, x10, x8
+```
+
+against the middle one:
+
+```
+fmov     d4, x9          ; in
 pmull.1q v4, v4, v9
-fmov  x9, d4          ; vector -> general-purpose
+fmov     x9, d4          ; out
 ```
 
-**An isolated microbenchmark got this backwards.** Timed on its own with a
-random feed, `pmull64` measured 1.029 ns a call against the shift version's
-1.119, and this note reported it as "faster per call, but under 1% of a
-parse". The per-call number was real and the conclusion drawn from it was
-wrong: what an operation costs depends on which register file its operand
-already lives in, and that is a property of the code around it, not of the
-operation. Only the in-place A/B answered it.
+The first measurement was the one that misled, and it was the isolated one.
+What an operation costs depends on which register file its operand already
+occupies, and that is a fact about the surrounding code. A microbenchmark
+removes exactly the context that decides it.
 
-So the portable version stays, now on the grounds that it is both portable and
-faster. On x86, where `pclmulqdq` takes its operands from the vector file that
-`pack_bits` would already be using, the answer could easily differ; nothing
-here has been measured on x86.
+Both the fold and the multiply are behind `CompilationTarget.has_neon()`, with
+`pack_bits` and six shift-and-XOR steps as the fallback. On x86, where
+`pclmulqdq` and the `pack_bits` lowering may well share the vector file
+already, the balance could be different again; nothing here has been measured
+on x86.
 
 ### The empty-chunk skip
 
@@ -205,21 +197,18 @@ the check is removed.
 
 ### What is left
 
-simdcsv is still about 1.8x ahead, 11.1 GB/s against 6.1. Three things it does
-that this does not:
+simdcsv is 1.16x ahead, 11.1 GB/s against 9.6. Two things it does that this
+does not:
 
 - **Buffering.** It processes four chunks into a small array of masks before
   flattening any of them, for pipelining, and reports that as its single
   biggest win after the bitmask work itself.
 - **Prefetching.** `__builtin_prefetch(buf + idx + 128)` on every chunk.
-- **No capacity check at all.** Its index buffer is padded once at the start
-  and the scan never checks, where this one checks per chunk.
 
-The profile also says the mask arithmetic -- prefix-XOR, the CRLF shift, the
-`& ~inside` -- is now the largest single phase at 1.90 ms of 5.60. That is
-where a fourth round would start. Carry-less multiply is not the answer there:
-re-measured once the walk stopped dominating, it is slower, for the reason
-above.
+Neither has been tried. The scan should also be re-profiled: the last
+breakdown was taken before the bulk movemask and the carry-less multiply, both
+of which cut the phase that was then largest, so it no longer describes where
+the time goes.
 
 ## Choosing the scan automatically
 

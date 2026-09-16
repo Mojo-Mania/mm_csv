@@ -23,11 +23,12 @@ such a field a literal double quote is written twice.
 
 from std.bit import count_trailing_zeros, pop_count
 from std.math import iota
-from std.memory import pack_bits
+from std.memory import bitcast, pack_bits
+from std.sys.intrinsics import llvm_intrinsic
 from std.memory import unsafe_memcpy
 from std.memory.alloc import Allocation, alloc, dealloc
 from std.os import abort
-from std.sys.info import simd_width_of
+from std.sys.info import CompilationTarget, simd_width_of
 
 comptime QUOTE = UInt8(ord('"'))
 comptime LF = UInt8(ord("\n"))
@@ -47,6 +48,59 @@ in ordinary register arithmetic. `pack_bits` turns a 64-lane comparison into
 that integer directly."""
 
 
+comptime _WEIGHTS = SIMD[DType.uint8, 16](
+    1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128
+)
+
+
+@always_inline
+def _movemask(
+    m0: SIMD[DType.bool, 16],
+    m1: SIMD[DType.bool, 16],
+    m2: SIMD[DType.bool, 16],
+    m3: SIMD[DType.bool, 16],
+) -> UInt64:
+    """Packs sixty-four lane flags into a `UInt64`, one bit each.
+
+    `pack_bits` does this portably, and is what the fallback uses. On ARM it
+    lowers to four independent sixteen-lane movemasks, each ending in a
+    `umov` -- four crossings out of the vector register file, per mask, per
+    chunk. Folding the four vectors together with `addp` first leaves **one**
+    crossing instead, which is what simdjson's `neonmovemask_bulk` is for, and
+    is worth 1.40x on the whole parse.
+
+    It also leaves the result in a vector register, which is what makes the
+    carry-less multiply in `_prefix_xor` worth having.
+    """
+    comptime if CompilationTarget.has_neon():
+        comptime weights = SIMD[DType.uint8, 16](
+            1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128
+        )
+
+        @always_inline
+        def addp(
+            a: SIMD[DType.uint8, 16], b: SIMD[DType.uint8, 16]
+        ) -> SIMD[DType.uint8, 16]:
+            return llvm_intrinsic[
+                "llvm.aarch64.neon.addp", SIMD[DType.uint8, 16]
+            ](a, b)
+
+        var t0 = m0.cast[DType.uint8]() * weights
+        var t1 = m1.cast[DType.uint8]() * weights
+        var t2 = m2.cast[DType.uint8]() * weights
+        var t3 = m3.cast[DType.uint8]() * weights
+        var folded = addp(addp(t0, t1), addp(t2, t3))
+        folded = addp(folded, folded)
+        return bitcast[DType.uint64, 2](folded)[0]
+    else:
+        return (
+            UInt64(pack_bits[DType.uint16](m0))
+            | (UInt64(pack_bits[DType.uint16](m1)) << 16)
+            | (UInt64(pack_bits[DType.uint16](m2)) << 32)
+            | (UInt64(pack_bits[DType.uint16](m3)) << 48)
+        )
+
+
 @always_inline
 def _prefix_xor(var bits: UInt64) -> UInt64:
     """Returns, for each bit, the XOR of every bit at or below it.
@@ -57,25 +111,28 @@ def _prefix_xor(var bits: UInt64) -> UInt64:
 
     A carry-less multiply by all-ones does this in a single instruction --
     `pclmulqdq` on x86, `pmull64` on ARM -- which is how simdjson and simdcsv
-    do it. Mojo reaches it through `llvm_intrinsic`, it agrees with this
-    function on every input tried, and on this machine it is **slower**. The
-    disassembly says why: these six steps compile to six `eor` instructions
-    with a free shifted operand, all in general-purpose registers, while
-    `pmull64` needs an `fmov` into the vector file and another back out --
-    `pack_bits` leaves the mask in a general-purpose register. Two
-    register-file crossings cost more than six ALU ops.
-
-    An isolated microbenchmark said the opposite, and was wrong: what an
-    operation costs depends on where its operand already lives, which is a
-    property of the surrounding code. See `docs/improvements.md`.
+    do it. Whether it is worth using turns out to depend entirely on what
+    packed the mask. With `pack_bits` the mask lands in a general-purpose
+    register, the intrinsic needs an `fmov` in and another out, and it loses
+    to six `eor`s. With the `addp` fold in `_movemask` the mask is already in
+    a vector register, there is no `fmov` in, and it wins by 13%. The shifts
+    are the fallback where there is no NEON. See `docs/improvements.md`.
     """
-    bits ^= bits << 1
-    bits ^= bits << 2
-    bits ^= bits << 4
-    bits ^= bits << 8
-    bits ^= bits << 16
-    bits ^= bits << 32
-    return bits
+    comptime if CompilationTarget.has_neon():
+        # `_movemask` leaves the mask in a vector register, so this takes it
+        # straight from there: one crossing on the way out, no `fmov` in.
+        var product = llvm_intrinsic[
+            "llvm.aarch64.neon.pmull64", SIMD[DType.uint8, 16]
+        ](bits, UInt64.MAX)
+        return bitcast[DType.uint64, 2](product)[0]
+    else:
+        bits ^= bits << 1
+        bits ^= bits << 2
+        bits ^= bits << 4
+        bits ^= bits << 8
+        bits ^= bits << 16
+        bits ^= bits << 32
+        return bits
 
 
 struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
@@ -243,10 +300,10 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
             The column count, or -1 if no line break was met.
         """
         var ptr = self._text.unsafe_ptr()
-        var quote_v = SIMD[DType.uint8, CHUNK](QUOTE)
-        var sep_v = SIMD[DType.uint8, CHUNK](Self.separator)
-        var lf_v = SIMD[DType.uint8, CHUNK](LF)
-        var cr_v = SIMD[DType.uint8, CHUNK](CR)
+        var quote_v = SIMD[DType.uint8, 16](QUOTE)
+        var sep_v = SIMD[DType.uint8, 16](Self.separator)
+        var lf_v = SIMD[DType.uint8, 16](LF)
+        var cr_v = SIMD[DType.uint8, 16](CR)
 
         # All ones while the scan is inside a quoted region, all zeros outside.
         var carried_quote = UInt64(0)
@@ -257,12 +314,23 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
         var written = 0
 
         while offset + CHUNK <= length:
-            var block = ptr.unsafe_offset(offset).unsafe_load[width=CHUNK]()
+            var b0 = ptr.unsafe_offset(offset).unsafe_load[width=16]()
+            var b1 = ptr.unsafe_offset(offset + 16).unsafe_load[width=16]()
+            var b2 = ptr.unsafe_offset(offset + 32).unsafe_load[width=16]()
+            var b3 = ptr.unsafe_offset(offset + 48).unsafe_load[width=16]()
 
-            var quotes = pack_bits[DType.uint64](block.eq(quote_v))
-            var separators = pack_bits[DType.uint64](block.eq(sep_v))
-            var line_feeds = pack_bits[DType.uint64](block.eq(lf_v))
-            var carriage_returns = pack_bits[DType.uint64](block.eq(cr_v))
+            var quotes = _movemask(
+                b0.eq(quote_v), b1.eq(quote_v), b2.eq(quote_v), b3.eq(quote_v)
+            )
+            var separators = _movemask(
+                b0.eq(sep_v), b1.eq(sep_v), b2.eq(sep_v), b3.eq(sep_v)
+            )
+            var line_feeds = _movemask(
+                b0.eq(lf_v), b1.eq(lf_v), b2.eq(lf_v), b3.eq(lf_v)
+            )
+            var carriage_returns = _movemask(
+                b0.eq(cr_v), b1.eq(cr_v), b2.eq(cr_v), b3.eq(cr_v)
+            )
 
             if (
                 quotes | separators | line_feeds | carriage_returns
