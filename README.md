@@ -22,15 +22,27 @@ print(table.get(1, 1))                          # first, and foremost
 The reader makes **one pass** over the document, recording where every field
 begins and ends, and then reading a value is index arithmetic. Nothing is
 copied per field unless you ask for it: `field` hands back a `StringSlice`
-borrowing the original text at **1.7 ns per field**, and `get` is the one that
+borrowing the original text at **0.8 ns per field**, and `get` is the one that
 undoes RFC 4180 escaping and allocates.
+
+There is a second reader, `CsvFields`, which builds no index at all and hands
+the fields back one at a time. It is **slower**, and the section below says by
+how much and when to want it anyway.
 
 ## When to use it
 
 **The reader owns the document.** `CsvTable` takes the whole text as a
 `String` and keeps it, because every field is a slice of it. That is what
-makes reading free; it also means the document has to fit in memory. There is
-no streaming reader here.
+makes reading free; it also means the document has to fit in memory.
+
+**Index first, stream only for a reason.** `CsvFields` walks the same chunks
+without writing an index, which sounds like it should be the faster way to
+read a document once. Measured, it is **20% slower** than building the index
+and walking it, for reasons in the performance section. What it buys is the
+four bytes a field that the index costs -- 8 MB on a 23 MB document -- and
+freedom from the 2 GiB ceiling, because its offsets are full-width integers.
+Take it when the memory matters or the document is enormous; otherwise take
+`CsvTable`.
 
 **Reach for `field` before `get`.** They differ by 7-10x. `get` allocates a
 `String` and undoes escaping; `field` gives you the raw bytes and copies
@@ -43,7 +55,8 @@ is kept as the reference implementation the tests compare against, not as an
 option you are meant to need.
 
 **Documents must be under 2 GiB.** Field positions are indexed with 31 bits
-and a flag; a larger document aborts with a message saying so.
+and a flag; a larger document aborts with a message saying so. `CsvFields` has
+no such limit.
 
 **Rows must be rectangular.** RFC 4180 says every row holds the same number of
 fields, and `get(row, column)` assumes it. `is_ragged()` reports a document
@@ -71,6 +84,24 @@ mm_csv = { git = "https://github.com/Mojo-Mania/mm_csv.git" }
 | `.get(row, column)` | The field, unescaped. Allocates. Raises if out of range. |
 | `.is_quoted(row, column)` | Whether the raw field is wrapped in quotes. |
 | `.is_ragged()` | Whether some row has a different field count. |
+
+Streaming, for a consumer that looks at each field once:
+
+| | |
+| --- | --- |
+| `CsvFields[separator](text)` | An iterator over the fields of `text`, which it borrows. Builds no index. |
+| `field.value` | The raw field, borrowed. |
+| `field.ends_row` | Whether a line break, or the end of the document, closed it. |
+| `field.unescaped()` | The field with RFC 4180 escaping undone. Allocates. |
+
+```mojo
+from mm_csv import CsvFields
+
+var total = 0
+for field in CsvFields(document):
+    if field.ends_row:
+        total += 1
+```
 
 ### Writing
 
@@ -107,30 +138,43 @@ fraction and field-length distribution. It prints the shape it produced.
 
 | | ms | MiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| parse, `simd=True` | **2.4** | **9289** | **1.2** |
-| parse, `simd=False` | 21.7 | 1012 | 10.6 |
-| read all, `field` (slice) | **3.4** | **6397** | **1.7** |
-| read all, `get` (String) | 25.7 | 855 | 12.6 |
-| build, `escape=False` | **18.9** | **1166** | **9.2** |
-| build, `escape=True` | 31.8 | 692 | 15.6 |
+| parse, `simd=True` | **2.4** | **9226** | **1.2** |
+| parse, `simd=False` | 21.7 | 1014 | 10.6 |
+| read all, `field` (slice) | **1.6** | **13907** | **0.8** |
+| read all, `get` (String) | 24.0 | 917 | 11.7 |
+| stream, no index | 4.8 | 4537 | 2.4 |
+| build, `escape=False` | **17.5** | **1254** | **8.6** |
+| build, `escape=True` | 30.7 | 717 | 15.0 |
 
 **`needs_escaping.csv`** — 24.9 MB, 201 182 rows, 10 columns, 10% quoted:
 
 | | ms | MiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| parse, `simd=True` | **2.4** | **9977** | **1.2** |
-| parse, `simd=False` | 23.3 | 1017 | 11.6 |
-| read all, `field` (slice) | **3.4** | **7070** | **1.7** |
-| read all, `get` (String) | 34.6 | 687 | 17.2 |
-| build, `escape=False` | **19.8** | **1197** | **9.9** |
-| build, `escape=True` | 35.2 | 696 | 17.5 |
+| parse, `simd=True` | **2.4** | **10015** | **1.2** |
+| parse, `simd=False` | 23.2 | 1024 | 11.5 |
+| read all, `field` (slice) | **1.6** | **14706** | **0.8** |
+| read all, `get` (String) | 32.8 | 723 | 16.3 |
+| stream, no index | 5.2 | 4596 | 2.6 |
+| build, `escape=False` | **17.5** | **1353** | **8.7** |
+| build, `escape=True` | 35.3 | 695 | 17.5 |
 
-Two things to read off these.
+Three things to read off these.
 
-**Borrowing beats copying by 7-10x.** Walking every field costs 1.7 ns each
-through `field` and 12-17 ns through `get`. That whole difference is
+**Borrowing beats copying by 15-20x.** Walking every field costs 0.8 ns each
+through `field` and 12-16 ns through `get`. That whole difference is
 allocating a `String` per field and undoing escaping. On a document with no
-quoted fields at all, `get` still costs 7x more, because it still allocates.
+quoted fields at all, `get` still costs 14x more, because it still allocates.
+
+**Not building the index costs more than building it.** Parsing and then
+walking every field is 2.4 + 1.6 = 4.0 ms; streaming the same fields with no
+index at all is 4.8. The reason is that the index is written by an unrolled
+loop that emits eight offsets per chunk whether or not eight delimiters are
+there, because writing a few junk entries into slack is free -- no branch per
+delimiter anywhere. A consumer cannot be handed junk fields, so `CsvFields`
+has to test and branch once per field, and that branch costs more than the
+store it avoids. Reading the index back afterwards is then a flat,
+predictable pass. Streaming is the right choice for the memory it saves, not
+for speed.
 
 **Escaping costs about 70% on writing**, not the 10x the upstream README
 warned of. That is the price of looking at every byte of every value, and the
@@ -153,14 +197,18 @@ It wins at every field width measured:
 
 | mean field bytes | scalar ms | simd ms | simd wins by |
 | ---: | ---: | ---: | ---: |
-| 2 | 6.9 | **3.6** | 1.92x |
-| 4 | 5.9 | **1.8** | 3.28x |
-| 8 | 6.2 | **1.1** | 5.64x |
-| 16 | 6.0 | **1.1** | 5.45x |
-| 32 | 6.0 | **1.1** | 5.45x |
-| 64 | 6.1 | **1.1** | 5.55x |
-| 128 | 6.6 | **0.8** | 8.25x |
-| 256 | 5.8 | **0.7** | 8.29x |
+| 2 | 6.9 | **4.3** | 1.62x |
+| 4 | 6.4 | **1.8** | 3.54x |
+| 8 | 5.5 | **1.1** | 4.81x |
+| 16 | 6.2 | **1.1** | 5.58x |
+| 32 | 6.1 | **1.1** | 5.39x |
+| 64 | 6.5 | **1.1** | 5.77x |
+| 128 | 6.7 | **0.8** | 8.50x |
+| 256 | 6.4 | **0.7** | 8.85x |
+
+The scalar column is the noisy one -- it moves about 10% between runs, and the
+two-byte row has been seen anywhere from 1.25x to 1.62x. The shape does not
+move: the win grows with field length and never disappears.
 
 That was not true of the first version of this scan, which looked at sixteen
 bytes and visited each match through a scratch buffer. It lost to the scalar
@@ -196,7 +244,7 @@ to 9.6 GB/s, **11x** the ported implementation. What is left is in
 ## Development
 
 ```bash
-pixi run test      # the test suite (21 tests)
+pixi run test      # the test suite (26 tests)
 pixi run main      # the example
 pixi run bench     # the tables above -- needs `bash data/setup.sh` first
 pixi run format    # mojo format

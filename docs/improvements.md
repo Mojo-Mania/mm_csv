@@ -263,19 +263,104 @@ on everything that is not storing and this spends 1768. The two
 implementations are within about 14% of each other on the work that is
 actually optional, and both are carrying the same ~525 us floor.
 
-Anything further has to come from writing less, not from scanning faster. Two
-shapes that would:
+Anything further, that note said, has to come from writing less rather than
+scanning faster, and it proposed two shapes. Both have since been built and
+measured. **Both are slower**, and the next three sections say why.
 
-- **Do not materialise the index at all** for callers that stream. An iterator
-  that yields fields as the scan finds them would skip the writes entirely,
-  and for a one-pass consumer -- sum a column, filter rows -- that is the
-  whole 23%. It is a different type with a different bargain, not a change to
-  this one.
-- **Narrow the index.** Four bytes a field is already the minimum for a 2 GiB
-  document, but a document under 16 MiB needs only three, and one under 64 KiB
-  only two. A width chosen from the document length would cut the store
-  traffic by a quarter or a half. Whether the unaligned loads that come with a
-  three-byte index pay for themselves has not been measured.
+### Not materialising the index: built, and 20% slower
+
+`CsvFields` is the scan with the writes taken out. It walks the same chunks,
+does the same bitmask arithmetic, and keeps the chunk's delimiter mask in the
+iterator, clearing one bit per `__next__`. Nothing is allocated and nothing is
+stored. On `no_escaping.csv`, one variant per process, best of twenty:
+
+| | microseconds |
+| --- | ---: |
+| build the index | 2338 |
+| walk every field of the built index | 1560 |
+| **both, fused** | **3848** |
+| **stream the same fields, no index** | **4692** |
+
+The prediction was that streaming would save the whole 23% the stores cost.
+It does save them. It loses more than that somewhere else, and the somewhere
+else is the shape of the emit.
+
+The indexed emit is unrolled into groups of eight and **writes eight offsets
+per chunk whether or not eight delimiters are there**, because a junk entry
+landing in slack costs nothing and is overwritten by the next chunk. That is
+what makes it branch-free: no test per delimiter anywhere. A consumer cannot
+be handed junk fields, so `CsvFields` has to test the mask once per field, and
+on this document -- eleven bytes a field, so five or six delimiters in a
+sixty-four byte chunk -- that branch is not well predicted. It costs more than
+the store it saves. Reading the index back afterwards is a flat, predictable
+pass with no data-dependent branches at all.
+
+A hand-written version with every piece of state in a local, rather than in
+the iterator, runs at 4553 us against the iterator's 4692: the abstraction is
+3% of it, and the branch is the rest.
+
+So `CsvFields` ships for what it actually offers -- no index memory, four
+bytes a field saved, and no 2 GiB ceiling because its offsets are full-width
+integers -- and not for speed. The README says so.
+
+### Narrowing the index: tried, and slower
+
+Three bytes a slot does **not** address a 16 MiB document, as the note above
+claimed: the CRLF flag takes the top bit, so three bytes reach 8 MiB and two
+reach 32 KiB. Measured on an 8 MB prefix that a three-byte slot can address,
+and on a synthetic document with a delimiter every other byte:
+
+| | 4-byte slots | 3-byte slots |
+| --- | ---: | ---: |
+| 8 MB, 707 886 fields | **787 us** | 984 us |
+| 8 MB, 4 000 000 fields | **2507 us** | 2912 us |
+
+A 25% saving in bytes written turns into a 16-25% *loss* in time, because
+narrowing does not change the number of stores -- one per field either way --
+and the stores are port-limited, not bandwidth-limited. What it does change is
+that every store is now unaligned and roughly one in twenty-one straddles a
+cache line.
+
+Two aligned bytes, which only a document under 32 KiB can use, is about 5%
+faster on a 32 KB document whose whole index fits in L1. That is a rounding
+error on a three-microsecond parse, bought with a crippling size limit.
+
+**A harness lesson, again.** The first version of this measurement had the
+scan write into a buffer that nothing ever read. LLVM deleted the allocation
+and every store into it, and the harness cheerfully reported that four-byte
+and three-byte slots both took 441 us -- and that four million fields took the
+same 441 us as seven hundred thousand. That last number is what gave it away:
+four million stores cannot happen in 441 us. Reading one entry back at the end
+of each repetition restored the stores and the numbers above.
+
+### Sharing the chunk step between the two scans: tried, costs 11%
+
+`CsvTable._scan_simd` and `CsvFields` run the same chunk arithmetic, so the
+obvious thing is one `@always_inline` helper returning the masks. It was
+written, it passed every test, and it cost **11% of the parse** -- 2560 us
+against 2293. The cause was not found: the helper does inline (one `pmull` in
+the binary, no separate symbol), and none of the obvious suspects account for
+it. Making the returned struct `TrivialRegisterPassable` is worth 2% of the
+11%; returning the carry state rather than taking it by `mut` changes nothing;
+hoisting the constant comparison vectors in or out of the loop changes
+nothing; computing `row_ends` lazily changes nothing; removing the
+empty-chunk early return makes it 5% worse still.
+
+So the arithmetic is written out twice, and `test_streaming_matches_the_table`
+walks every corpus both ways to stop the copies drifting apart.
+
+### The read path was not being inlined
+
+Found while reconciling two harnesses that disagreed. `CsvTable.field` is a
+small function, and with one caller it inlined and cost 0.8 ns a field. Add a
+second caller in the same module -- `get` calls it too -- and LLVM stopped
+inlining it, at which point every field read paid a call and the raising
+convention: **1.8 ns, 2.2x worse**. The benchmark had been reporting the slow
+number since the file was written, and adding the streaming row to the same
+benchmark is what made the inconsistency visible.
+
+`field` is now `@always_inline`. Reading a whole document went from 3.5 ms to
+1.6 ms, and `get`, which calls it, from 26.6 ms to 24.0.
 
 ## Choosing the scan automatically
 
@@ -323,5 +408,7 @@ checked.
 
 `CsvTable` takes the whole document and keeps it, because every field borrows
 from it. That is what makes `field` free, and it means a document has to fit
-in memory. A streaming reader would be a different type with a different
-bargain, not a change to this one.
+in memory. `CsvFields` is the different type with the different bargain -- see
+"Not materialising the index" above -- but it borrows the whole document too.
+Reading a document that does not fit in memory, from a file or a socket, is
+still not something either type does.

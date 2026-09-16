@@ -22,7 +22,7 @@ is valid no matter what goes into it.
 Throughput is MiB/s over the document. Higher is better.
 """
 
-from mm_csv import CsvBuilder, CsvTable
+from mm_csv import CsvBuilder, CsvFields, CsvTable
 from std.benchmark import keep
 from std.pathlib import cwd
 from std.time import perf_counter_ns
@@ -83,6 +83,72 @@ def load(name: String) raises -> String:
     return path.read_text()
 
 
+def time_read_slice(table: CsvTable, rows: Int, columns: Int) raises -> Float64:
+    """Times reading every field as a borrowed slice.
+
+    In its own function on purpose. Measured inside `bench_file` alongside
+    everything else it came out 2.2x slower than the same loop alone, because
+    `field` stops being inlined in a function that large -- which made the
+    streaming row look like it won when it does not.
+    """
+    var best = Float64(1e30)
+    for _ in range(_REPEATS):
+        var start = perf_counter_ns()
+        var total = 0
+        for row in range(rows):
+            for column in range(columns):
+                total += table.field(row, column).byte_length()
+        var elapsed = Float64(perf_counter_ns() - start)
+        keep(total)
+        if elapsed < best:
+            best = elapsed
+    return best
+
+
+def time_read_get(table: CsvTable, rows: Int, columns: Int) raises -> Float64:
+    """Times reading every field as an unescaped `String`."""
+    var best = Float64(1e30)
+    for _ in range(_REPEATS):
+        var start = perf_counter_ns()
+        var total = 0
+        for row in range(rows):
+            for column in range(columns):
+                total += table.get(row, column).byte_length()
+        var elapsed = Float64(perf_counter_ns() - start)
+        keep(total)
+        if elapsed < best:
+            best = elapsed
+    return best
+
+
+def time_stream(text: String) raises -> Float64:
+    """Times one streaming pass: no index is built and none is read."""
+    var best = Float64(1e30)
+    for _ in range(_REPEATS):
+        var start = perf_counter_ns()
+        var total = 0
+        for field in CsvFields(text):
+            total += field.value.byte_length()
+        var elapsed = Float64(perf_counter_ns() - start)
+        keep(total)
+        if elapsed < best:
+            best = elapsed
+    return best
+
+
+def time_parse(text: String, simd: Bool) raises -> Float64:
+    """Times building the index and nothing else."""
+    var best = Float64(1e30)
+    for _ in range(_REPEATS):
+        var start = perf_counter_ns()
+        var table = CsvTable(text, simd=simd)
+        var elapsed = Float64(perf_counter_ns() - start)
+        keep(table.column_count)
+        if elapsed < best:
+            best = elapsed
+    return best
+
+
 def bench_file(name: String) raises:
     var text = load(name)
     var bytes = text.byte_length()
@@ -110,43 +176,31 @@ def bench_file(name: String) raises:
     )
 
     for use_simd in [True, False]:
-        var best = Float64(1e30)
-        for _ in range(_REPEATS):
-            var start = perf_counter_ns()
-            var table = CsvTable(text, simd=use_simd)
-            var elapsed = Float64(perf_counter_ns() - start)
-            keep(table.column_count)
-            if elapsed < best:
-                best = elapsed
-        report(String("parse, simd=", use_simd), best, bytes, fields)
+        report(
+            String("parse, simd=", use_simd),
+            time_parse(text, use_simd),
+            bytes,
+            fields,
+        )
 
     var table = CsvTable(text)
+    report(
+        "read all, field (slice)",
+        time_read_slice(table, rows, columns),
+        bytes,
+        fields,
+    )
+    report(
+        "read all, get (String)",
+        time_read_get(table, rows, columns),
+        bytes,
+        fields,
+    )
 
-    var best_slice = Float64(1e30)
-    for _ in range(_REPEATS):
-        var start = perf_counter_ns()
-        var total = 0
-        for row in range(rows):
-            for column in range(columns):
-                total += table.field(row, column).byte_length()
-        var elapsed = Float64(perf_counter_ns() - start)
-        keep(total)
-        if elapsed < best_slice:
-            best_slice = elapsed
-    report("read all, field (slice)", best_slice, bytes, fields)
-
-    var best_get = Float64(1e30)
-    for _ in range(_REPEATS):
-        var start = perf_counter_ns()
-        var total = 0
-        for row in range(rows):
-            for column in range(columns):
-                total += table.get(row, column).byte_length()
-        var elapsed = Float64(perf_counter_ns() - start)
-        keep(total)
-        if elapsed < best_get:
-            best_get = elapsed
-    report("read all, get (String)", best_get, bytes, fields)
+    # No index at all: the parse and the read happen together, so this row
+    # belongs against `parse` plus `read all, field` added up, not against
+    # either on its own.
+    report("stream, no index", time_stream(text), bytes, fields)
 
     # Writing: feed every value straight back out.
     for escape in [False, True]:

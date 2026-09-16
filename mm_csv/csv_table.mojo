@@ -500,6 +500,7 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
         var end = Int(raw & Self._OFFSET_MASK) - Int(raw >> 31)
         return (start, end)
 
+    @always_inline
     def field[
         origin: ImmOrigin, //
     ](ref[origin] self, row: Int, column: Int) raises -> StringSlice[origin]:
