@@ -23,7 +23,19 @@ and asserts the same fields in the same order.
 """
 
 from std.bit import count_trailing_zeros
-from .csv_table import CHUNK, COMMA, CR, LF, QUOTE, _movemask, _prefix_xor
+from std.memory import pack_bits
+from .csv_table import (
+    CHUNK,
+    COMMA,
+    CR,
+    LF,
+    QUOTE,
+    _HALF_COMPARE,
+    _WIDE_COMPARE,
+    _join,
+    _movemask,
+    _prefix_xor,
+)
 
 
 @fieldwise_init
@@ -196,28 +208,49 @@ struct CsvFields[origin: ImmOrigin, //, separator: UInt8 = COMMA](
                 break
             self._next_chunk = offset + CHUNK
 
-            var b0 = ptr.unsafe_offset(offset).unsafe_load[width=16]()
-            var b1 = ptr.unsafe_offset(offset + 16).unsafe_load[width=16]()
-            var b2 = ptr.unsafe_offset(offset + 32).unsafe_load[width=16]()
-            var b3 = ptr.unsafe_offset(offset + 48).unsafe_load[width=16]()
+            var quotes: UInt64
+            var separators: UInt64
+            var line_feeds: UInt64
+            var carriage_returns: UInt64
+            comptime if _WIDE_COMPARE:
+                var b = ptr.unsafe_offset(offset).unsafe_load[width=64]()
+                quotes = pack_bits[DType.uint64](b.eq(QUOTE))
+                separators = pack_bits[DType.uint64](b.eq(Self.separator))
+                line_feeds = pack_bits[DType.uint64](b.eq(LF))
+                carriage_returns = pack_bits[DType.uint64](b.eq(CR))
+            elif _HALF_COMPARE:
+                var lo = ptr.unsafe_offset(offset).unsafe_load[width=32]()
+                var hi = ptr.unsafe_offset(offset + 32).unsafe_load[width=32]()
+                quotes = _join(lo.eq(QUOTE), hi.eq(QUOTE))
+                separators = _join(lo.eq(Self.separator), hi.eq(Self.separator))
+                line_feeds = _join(lo.eq(LF), hi.eq(LF))
+                carriage_returns = _join(lo.eq(CR), hi.eq(CR))
+            else:
+                var b0 = ptr.unsafe_offset(offset).unsafe_load[width=16]()
+                var b1 = ptr.unsafe_offset(offset + 16).unsafe_load[width=16]()
+                var b2 = ptr.unsafe_offset(offset + 32).unsafe_load[width=16]()
+                var b3 = ptr.unsafe_offset(offset + 48).unsafe_load[width=16]()
 
-            var quote_v = SIMD[DType.uint8, 16](QUOTE)
-            var sep_v = SIMD[DType.uint8, 16](Self.separator)
-            var lf_v = SIMD[DType.uint8, 16](LF)
-            var cr_v = SIMD[DType.uint8, 16](CR)
+                var quote_v = SIMD[DType.uint8, 16](QUOTE)
+                var sep_v = SIMD[DType.uint8, 16](Self.separator)
+                var lf_v = SIMD[DType.uint8, 16](LF)
+                var cr_v = SIMD[DType.uint8, 16](CR)
 
-            var quotes = _movemask(
-                b0.eq(quote_v), b1.eq(quote_v), b2.eq(quote_v), b3.eq(quote_v)
-            )
-            var separators = _movemask(
-                b0.eq(sep_v), b1.eq(sep_v), b2.eq(sep_v), b3.eq(sep_v)
-            )
-            var line_feeds = _movemask(
-                b0.eq(lf_v), b1.eq(lf_v), b2.eq(lf_v), b3.eq(lf_v)
-            )
-            var carriage_returns = _movemask(
-                b0.eq(cr_v), b1.eq(cr_v), b2.eq(cr_v), b3.eq(cr_v)
-            )
+                quotes = _movemask(
+                    b0.eq(quote_v),
+                    b1.eq(quote_v),
+                    b2.eq(quote_v),
+                    b3.eq(quote_v),
+                )
+                separators = _movemask(
+                    b0.eq(sep_v), b1.eq(sep_v), b2.eq(sep_v), b3.eq(sep_v)
+                )
+                line_feeds = _movemask(
+                    b0.eq(lf_v), b1.eq(lf_v), b2.eq(lf_v), b3.eq(lf_v)
+                )
+                carriage_returns = _movemask(
+                    b0.eq(cr_v), b1.eq(cr_v), b2.eq(cr_v), b3.eq(cr_v)
+                )
 
             if (
                 quotes | separators | line_feeds | carriage_returns

@@ -12,10 +12,10 @@ byte compare when the field is read. Keeping both ends cost sixteen bytes per
 field and, measured, as much time again as the scan that filled them.
 
 The scan can be done two ways. `_scan_scalar` walks a byte at a time and is the
-definition of what the parser does. `_scan_simd` loads `simd_width_of[uint8]()`
-bytes at once, compares them against quote, separator and newline in parallel,
-and only visits the positions where something matched. Both produce the same
-index, which is what `test/test_csv.mojo` checks on every corpus.
+definition of what the parser does. `_scan_simd` loads sixty-four bytes at
+once, compares them against quote, separator and newline in parallel, and only
+visits the positions where something matched. Both produce the same index,
+which is what `test/test_csv.mojo` checks on every corpus.
 
 Escaping follows RFC 4180: a field may be wrapped in double quotes, and inside
 such a field a literal double quote is written twice.
@@ -48,6 +48,29 @@ in ordinary register arithmetic. `pack_bits` turns a 64-lane comparison into
 that integer directly."""
 
 
+comptime _WIDE_COMPARE = CompilationTarget._has_feature["avx512bw"]()
+"""Whether to compare all sixty-four bytes of a chunk in one vector.
+
+With AVX-512BW a 64-lane comparison lands in a mask register and one `kmovq`
+takes it out: four compares and four crossings a chunk. The portable
+sixteen-lane path lowered to sixteen of each, reassembled with `vpinsrw`, and
+this is 1.69x faster on the whole parse. See `docs/improvements.md`."""
+
+
+comptime _HALF_COMPARE = CompilationTarget.has_avx2()
+"""Whether to compare a chunk thirty-two bytes at a time, where there is AVX2
+but no AVX-512BW: two `vpmovmskb`s a mask instead of four. Checked after
+`_WIDE_COMPARE`, which takes precedence."""
+
+
+@always_inline
+def _join(lo: SIMD[DType.bool, 32], hi: SIMD[DType.bool, 32]) -> UInt64:
+    """Packs two thirty-two lane comparisons into one `UInt64`."""
+    return UInt64(pack_bits[DType.uint32](lo)) | (
+        UInt64(pack_bits[DType.uint32](hi)) << 32
+    )
+
+
 comptime _WEIGHTS = SIMD[DType.uint8, 16](
     1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128
 )
@@ -61,6 +84,9 @@ def _movemask(
     m3: SIMD[DType.bool, 16],
 ) -> UInt64:
     """Packs sixty-four lane flags into a `UInt64`, one bit each.
+
+    Only the ARM and portable paths come through here; x86 compares wider
+    vectors directly, see `_WIDE_COMPARE` and `_HALF_COMPARE`.
 
     `pack_bits` does this portably, and is what the fallback uses. On ARM it
     lowers to four independent sixteen-lane movemasks, each ending in a
@@ -115,8 +141,10 @@ def _prefix_xor(var bits: UInt64) -> UInt64:
     packed the mask. With `pack_bits` the mask lands in a general-purpose
     register, the intrinsic needs an `fmov` in and another out, and it loses
     to six `eor`s. With the `addp` fold in `_movemask` the mask is already in
-    a vector register, there is no `fmov` in, and it wins by 13%. The shifts
-    are the fallback where there is no NEON. See `docs/improvements.md`.
+    a vector register, there is no `fmov` in, and it wins by 13%. On x86
+    `pclmulqdq` is worth 7% even though its operand comes from a `kmovq` and
+    has to cross in. The shifts are the fallback where neither is available.
+    See `docs/improvements.md`.
 
     `PMULL` sits behind AArch64's `aes` feature, and NEON being available does
     not imply it. `CompilationTarget.has_neon()` answers True for any Apple
@@ -135,6 +163,17 @@ def _prefix_xor(var bits: UInt64) -> UInt64:
             "llvm.aarch64.neon.pmull64", SIMD[DType.uint8, 16]
         ](bits, UInt64.MAX)
         return bitcast[DType.uint64, 2](product)[0]
+    elif CompilationTarget._has_feature["pclmul"]():
+        # `pclmulqdq` does it in one instruction on x86. It works on vector
+        # registers too, so the mask pays one crossing in and one out.
+        var product = llvm_intrinsic[
+            "llvm.x86.pclmulqdq", SIMD[DType.uint64, 2]
+        ](
+            SIMD[DType.uint64, 2](bits, 0),
+            SIMD[DType.uint64, 2](UInt64.MAX, 0),
+            Int8(0),
+        )
+        return product[0]
     else:
         bits ^= bits << 1
         bits ^= bits << 2
@@ -330,23 +369,44 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
         var slots = self._slots
 
         while offset + CHUNK <= length:
-            var b0 = ptr.unsafe_offset(offset).unsafe_load[width=16]()
-            var b1 = ptr.unsafe_offset(offset + 16).unsafe_load[width=16]()
-            var b2 = ptr.unsafe_offset(offset + 32).unsafe_load[width=16]()
-            var b3 = ptr.unsafe_offset(offset + 48).unsafe_load[width=16]()
+            var quotes: UInt64
+            var separators: UInt64
+            var line_feeds: UInt64
+            var carriage_returns: UInt64
+            comptime if _WIDE_COMPARE:
+                var b = ptr.unsafe_offset(offset).unsafe_load[width=64]()
+                quotes = pack_bits[DType.uint64](b.eq(QUOTE))
+                separators = pack_bits[DType.uint64](b.eq(Self.separator))
+                line_feeds = pack_bits[DType.uint64](b.eq(LF))
+                carriage_returns = pack_bits[DType.uint64](b.eq(CR))
+            elif _HALF_COMPARE:
+                var lo = ptr.unsafe_offset(offset).unsafe_load[width=32]()
+                var hi = ptr.unsafe_offset(offset + 32).unsafe_load[width=32]()
+                quotes = _join(lo.eq(QUOTE), hi.eq(QUOTE))
+                separators = _join(lo.eq(Self.separator), hi.eq(Self.separator))
+                line_feeds = _join(lo.eq(LF), hi.eq(LF))
+                carriage_returns = _join(lo.eq(CR), hi.eq(CR))
+            else:
+                var b0 = ptr.unsafe_offset(offset).unsafe_load[width=16]()
+                var b1 = ptr.unsafe_offset(offset + 16).unsafe_load[width=16]()
+                var b2 = ptr.unsafe_offset(offset + 32).unsafe_load[width=16]()
+                var b3 = ptr.unsafe_offset(offset + 48).unsafe_load[width=16]()
 
-            var quotes = _movemask(
-                b0.eq(quote_v), b1.eq(quote_v), b2.eq(quote_v), b3.eq(quote_v)
-            )
-            var separators = _movemask(
-                b0.eq(sep_v), b1.eq(sep_v), b2.eq(sep_v), b3.eq(sep_v)
-            )
-            var line_feeds = _movemask(
-                b0.eq(lf_v), b1.eq(lf_v), b2.eq(lf_v), b3.eq(lf_v)
-            )
-            var carriage_returns = _movemask(
-                b0.eq(cr_v), b1.eq(cr_v), b2.eq(cr_v), b3.eq(cr_v)
-            )
+                quotes = _movemask(
+                    b0.eq(quote_v),
+                    b1.eq(quote_v),
+                    b2.eq(quote_v),
+                    b3.eq(quote_v),
+                )
+                separators = _movemask(
+                    b0.eq(sep_v), b1.eq(sep_v), b2.eq(sep_v), b3.eq(sep_v)
+                )
+                line_feeds = _movemask(
+                    b0.eq(lf_v), b1.eq(lf_v), b2.eq(lf_v), b3.eq(lf_v)
+                )
+                carriage_returns = _movemask(
+                    b0.eq(cr_v), b1.eq(cr_v), b2.eq(cr_v), b3.eq(cr_v)
+                )
 
             if (
                 quotes | separators | line_feeds | carriage_returns
