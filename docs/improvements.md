@@ -1,10 +1,14 @@
 # Identified improvements
 
+Everything up to "Choosing the scan automatically" was measured on an Apple M4
+Max. The x86 work, on an AMD Ryzen AI 9 HX 370, is in its own section, "x86:
+the scan was running the portable path", near the end.
+
 ## What simdcsv does that this does not
 
 [geofflangdale/simdcsv](https://github.com/geofflangdale/simdcsv) is a
 structural scanner for RFC 4180 built on the simdjson techniques. Measured on
-this machine against the same two documents, it finds exactly the same
+the M4 against the same two documents, it finds exactly the same
 delimiters -- 2 042 888 in `no_escaping.csv`, matching commas plus line feeds
 -- and it does so **about eleven times faster**:
 
@@ -149,10 +153,10 @@ occupies, and that is a fact about the surrounding code. A microbenchmark
 removes exactly the context that decides it.
 
 Both the fold and the multiply are behind `CompilationTarget.has_neon()`, with
-`pack_bits` and six shift-and-XOR steps as the fallback. On x86, where
-`pclmulqdq` and the `pack_bits` lowering may well share the vector file
-already, the balance could be different again; nothing here has been measured
-on x86.
+`pack_bits` and six shift-and-XOR steps as the fallback. On x86 the balance
+turned out different again: `pclmulqdq` is worth 7% even though its operand
+arrives from a general-purpose register -- see "x86: the scan was running the
+portable path" below.
 
 ### The empty-chunk skip
 
@@ -231,8 +235,8 @@ version, 17 against 42 -- but the group-of-four unrolling makes the scan
 region 3614 instructions where the plain one is 938. Whatever the overlap
 bought, it did not cover that.
 
-Neither is kept. Both are worth re-trying if this is ever built for x86, which
-is what simdcsv was tuned on: it reports buffering as its biggest win after
+Neither is kept. Both are worth re-trying on x86, which is what simdcsv was
+tuned on, and which has now been measured but not with these: it reports buffering as its biggest win after
 the bitmask work, and that claim was measured on a different machine, a
 different compiler and a different instruction set.
 
@@ -317,6 +321,12 @@ the iterator, runs at 4553 us against the iterator's 4692: the abstraction is
 So `CsvFields` ships for what it actually offers -- no index memory, four
 bytes a field saved, and no 2 GiB ceiling because its offsets are full-width
 integers -- and not for speed. The README says so.
+
+On x86, after the scan got its own x86 paths, the gap closes: indexing and
+walking `no_escaping.csv` costs 4.04 ms against 4.08 for streaming, and 4.13
+against 4.25 on `needs_escaping.csv`. Level, not faster. The branch per field
+is evidently cheaper on that core, but it still does not buy back more than
+the stores cost.
 
 ### Narrowing the index: tried, and slower
 
@@ -517,47 +527,105 @@ distance to simdcsv's `-DCRLF` build, which does the fourth comparison and is
 somehow 10% faster than its own default build for an identical index, is not
 accounted for.
 
-## Choosing the scan automatically
+## Choosing the scan automatically: no longer needed
 
-`CsvTable` defaults to the vectorised scan, and the README's sweep shows that
-is the wrong choice for documents with short fields — by 12% at two bytes a
-field, against a 4x win at 128. Picking per document rather than per caller
-looks like free money.
+This section used to argue that the vectorised scan lost to the scalar walk on
+short fields -- by 12% at two bytes, and on both real documents -- and that
+picking a scan per document needed a better predictor than mean field length.
+That was true of the sixteen-byte `compressed_store` scan it measured. The
+bitmask scan that replaced it wins at every field width measured, on both
+machines: 1.6x to 8.9x on the M4, 2.1x to 12.6x on x86. There is no losing case
+left to predict, so `simd=True` stays the unconditional default.
 
-It is not, yet, because **the obvious predictor does not work**. Mean bytes per
-field is cheap to sample and is what the sweep varies, so it ought to say which
-scan to use. It does not:
+The same rewrite answered the question the next section here used to ask --
+whether Mojo can turn a SIMD comparison into an integer bitmask. It can:
+`std.memory.pack_bits`, see "`pack_bits` is the movemask" above.
 
-| | bytes/field | scalar | simd | winner |
-| --- | ---: | ---: | ---: | --- |
-| uniform sweep | 9 | 6.9 ms | 5.3 ms | simd, 1.30x |
-| `no_escaping.csv` | 11.3 | 22.5 ms | 25.8 ms | scalar, 1.15x |
-| `needs_escaping.csv` | 12.4 | 24.1 ms | 28.7 ms | scalar, 1.19x |
+## x86: the scan was running the portable path
 
-At a *larger* mean field length the real documents prefer the *other* scan. A
-uniform width is not the same shape as a real distribution — median 6, mean 10,
-a tail out to 46 — and something about that distribution, not its mean, decides
-the winner. Until there is a statistic that separates these three rows
-correctly, an automatic choice would be a guess wearing a measurement's
-clothes.
+Everything above was tuned on ARM, and every ARM-specific piece -- the `addp`
+fold and `pmull64` -- sits behind `has_neon()`. On x86 that left the portable
+path: four sixteen-lane loads, and for each of the four masks, four
+`pack_bits[DType.uint16]` calls. Disassembled on an AMD Ryzen AI 9 HX 370
+(AVX-512), that is sixteen `vpcmpeqb` into mask registers, sixteen `kmovd` out
+to general-purpose registers, and then the compiler putting the halves back
+together in the vector file:
 
-What would settle it: sweep the field-length *distribution* rather than a
-single width — same mean, different variance — and see whether the crossover
-tracks variance, the median, or the fraction of chunks containing no delimiter
-at all. That last one is the mechanism the scan actually cares about, and it is
-as cheap to sample as the mean.
+```
+vpcmpeqb k0,xmm1,xmm19
+kmovd    esi,k0            ; sixteen of these a chunk
+vmovd    xmm1,edi
+vpinsrw  xmm1,xmm1,esi,0x1 ; and back into a vector
+vpmovzxwq ymm1,xmm1
+vpsllq   ymm2,ymm2,0x10
+vpternlogq ymm1,ymm2,ymm0,0xfe
+```
 
-## A bitmask instead of `compressed_store`
+followed by six shift-and-XOR pairs for the prefix-XOR. The benchmark had
+been saying so all along without it being read that way: from eight-byte to
+sixty-four-byte fields the simd column sat at exactly 2.5 ms, and 12 MB is
+187 500 chunks, so about 13 ns a chunk no matter what the chunk held. The real
+document came out the same: 4584 us over 360 223 chunks. A per-chunk constant
+that large is packing, not walking.
 
-The SIMD scan stores matching lane indices to a scratch buffer and then reads
-them back, and for each one indexes into the comparison masks — `quotes[lane]`,
-`line_feeds[lane]` — with a runtime index. Dynamic lane extraction usually goes
-through memory, and there are three of them per match.
+x86 got the equivalents of the two ARM pieces:
 
-Turning each mask into an integer bitmask once per chunk and walking the set
-bits with a count-trailing-zeros loop would answer all three questions with bit
-tests instead. Whether Mojo exposes a SIMD-to-bitmask conversion has not been
-checked.
+- **With AVX-512BW**, the chunk is loaded as one `SIMD[DType.uint8, 64]`,
+  compared once per mask, and `pack_bits[DType.uint64]` lowers to exactly
+  `vpcmpeqb zmm` into a mask register and one `kmovq` out. Four crossings a
+  chunk where there were sixteen, and none of the reassembly.
+- **With AVX2 and no AVX-512BW**, two thirty-two lane halves, and each
+  `pack_bits[DType.uint32]` is one `vpmovmskb`: eight crossings.
+- **With `pclmul`**, the prefix-XOR is `llvm.x86.pclmulqdq`, one
+  `vpclmullqlqdq`.
+
+Best of 400 parses of `no_escaping.csv`:
+
+| | microseconds | |
+| --- | ---: | ---: |
+| portable path | 4584 | |
+| 64-lane compare, shifts for the prefix-XOR | 2720 | 1.69x |
+| 64-lane compare and `pclmulqdq` | **2535** | **1.81x** |
+| AVX2 build, portable compare, `pclmulqdq` | 3894 | |
+| AVX2 build, 32-lane halves, `pclmulqdq` | **2826** | **1.38x** |
+
+The AVX2 rows are the same binary harness built with
+`--target-features=-avx512f,-avx512bw`, on the same core, so they say what the
+code does without AVX-512, not what an AVX2-only chip would measure.
+
+**`pclmulqdq` pays here where `pmull64` did not on ARM with `pack_bits`.** On
+ARM the version whose operand came from a general-purpose register lost 0.8%;
+this one takes its operand from a `kmovq` into a general-purpose register and
+wins 7%. The six shifts it replaces are the same on both, so the difference is
+in the cost of the crossing and of the multiply, and it is one more reason not
+to carry a verdict from one instruction set to another.
+
+The ARM path is untouched, and checked: an `aarch64-apple-darwin` build for
+`apple-m4` produces the same assembly before and after, apart from line
+numbers in one abort message. All 26 tests pass on x86 with the host features,
+and with AVX-512, AVX2 and `pclmul` switched off in each combination; the
+disassembly of each build carries the instructions it should (`kmovq`,
+`pmovmskb`, `pclmul`, or none of them).
+
+Parsing is now 8.3-8.6 GiB/s on x86, from 4.4, against 9.4-10.3 on the M4.
+Across the field-width sweep the simd column improved 1.4x at two-byte fields
+and 2x to 3.3x everywhere else.
+
+### What is left on x86
+
+**The sweep is still flat**, at 1.3 ms from eight-byte fields to sixty-four,
+which is still about 7 ns a chunk of fixed cost. With packing down to four
+`kmovq`s that is no longer obviously the packing.
+
+**The emit spills.** In the disassembly the unrolled delimiter walk stores
+several of its intermediate `bits` values to the stack
+(`mov QWORD PTR [rsp+...]`) rather than keeping them in registers. That is
+the first thing to measure, since the ARM profile put this walk at nearly half
+the scan.
+
+**Buffering and prefetching are untried here**, and x86 is where simdcsv found
+buffering worth the most. **simdcsv itself is unmeasured on x86**, so there is
+no gap to quote yet.
 
 ## Streaming
 
