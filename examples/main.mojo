@@ -1,6 +1,6 @@
 """Reading and writing CSV."""
 
-from mm_csv import CsvBuilder, CsvFields, CsvTable
+from mm_csv import CsvBuilder, CsvFields, CsvTable, to_csv
 
 
 def writing() raises:
@@ -24,6 +24,24 @@ def writing() raises:
 
     var document = builder^.finish()
     print(repr(document))
+
+
+@fieldwise_init
+struct Reading(Copyable):
+    var station: String
+    var hour: Int
+    var celsius: Float64
+
+
+def writing_structs():
+    print("\n--- writing structs ---")
+    # The header is the field names; each struct is a row. Strings are
+    # checked for quoting, numbers are not.
+    var readings: List[Reading] = [
+        Reading("north, upper", 7, 12.5),
+        Reading("south", 8, -3.0),
+    ]
+    print(repr(to_csv(readings)))
 
 
 def reading() raises:
@@ -79,6 +97,7 @@ def tab_separated() raises:
 
 def main() raises:
     writing()
+    writing_structs()
     reading()
     streaming()
     tab_separated()

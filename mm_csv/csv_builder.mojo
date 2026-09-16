@@ -12,7 +12,7 @@ worth roughly an order of magnitude, and `benchmarks/bench_csv.mojo` measures
 exactly how much.
 """
 
-from std.memory import unsafe_memcpy
+from std.memory import unsafe_memcpy, unsafe_memmove
 from std.os import abort
 from std.memory.alloc import Allocation, alloc, dealloc
 from std.sys.info import simd_width_of
@@ -219,11 +219,16 @@ struct CsvBuilder[separator: UInt8 = COMMA](Movable, Sized):
         self._length += 1
         self._field_count += 1
 
+    @always_inline
     def push_value[T: Writable](mut self, value: T, *, escape: Bool = False):
         """Appends anything `Writable` -- a number, or a type of your own.
 
         Numbers never need escaping, so `escape` is off by default here, the
         other way round from the string `push`.
+
+        The value renders straight into the document, with no `String` in
+        between. When `escape` is on and the rendered text turns out to need
+        quoting, it is quoted where it lies.
 
         Parameters:
             T: The value's type.
@@ -233,9 +238,68 @@ struct CsvBuilder[separator: UInt8 = COMMA](Movable, Sized):
             escape: Whether to check the rendered text for bytes needing
                 quotes.
         """
-        var rendered = String()
-        rendered.write(value)
-        self.push(rendered, escape=escape)
+        self._write_delimiter()
+        var start = self._length
+        var writer = _FieldWriter[Self.separator](
+            Pointer(to=self).unsafe_origin_cast[MutUntrackedOrigin]()
+        )
+        value.write_to(writer)
+        if escape and self._needs_escaping(
+            StringSlice(
+                unsafe_from_utf8=Span[UInt8, MutUntrackedOrigin](
+                    unsafe_ptr=self._buffer.unsafe_offset(start),
+                    length=self._length - start,
+                )
+            )
+        ):
+            self._quote_in_place(start)
+        self._field_count += 1
+
+    @always_inline
+    def _append(mut self, bytes: StringSpan):
+        """Copies `bytes` onto the end of the buffer, unchecked."""
+        var length = bytes.byte_length()
+        self._reserve(length)
+        unsafe_memcpy(
+            dest=self._buffer.unsafe_offset(self._length),
+            src=bytes.unsafe_ptr(),
+            count=length,
+        )
+        self._length += length
+
+    def _quote_in_place(mut self, start: Int):
+        """Quotes the bytes from `start` to the end, doubling inner quotes.
+
+        Walks backwards, so every byte moves right before anything is written
+        over it.
+        """
+        var length = self._length - start
+        var quotes = 0
+        for i in range(start, self._length):
+            if self._buffer[unsafe_offset=i] == QUOTE:
+                quotes += 1
+        self._reserve(quotes + 2)
+        var ptr = self._buffer
+        if quotes == 0:
+            unsafe_memmove(
+                dest=ptr.unsafe_offset(start + 1),
+                src=ptr.unsafe_offset(start),
+                count=length,
+            )
+        else:
+            var dest = start + length + quotes
+            var i = start + length
+            while i > start:
+                i -= 1
+                var byte = ptr[unsafe_offset=i]
+                ptr[unsafe_offset=dest] = byte
+                dest -= 1
+                if byte == QUOTE:
+                    ptr[unsafe_offset=dest] = QUOTE
+                    dest -= 1
+        ptr[unsafe_offset=start] = QUOTE
+        ptr[unsafe_offset=start + length + quotes + 1] = QUOTE
+        self._length += quotes + 2
 
     def push_empty(mut self):
         """Appends an empty field."""
@@ -275,3 +339,25 @@ struct CsvBuilder[separator: UInt8 = COMMA](Movable, Sized):
             )
         )
         return text^
+
+
+struct _FieldWriter[separator: UInt8](Writer):
+    """Renders a `Writable` value straight into a builder's buffer.
+
+    A separate type so that `CsvBuilder` itself is not a `Writer`: writing to
+    it directly would add bytes without counting a field.
+    """
+
+    var _builder: Pointer[CsvBuilder[Self.separator], MutUntrackedOrigin]
+
+    def __init__(
+        out self,
+        builder: Pointer[CsvBuilder[Self.separator], MutUntrackedOrigin],
+    ):
+        """Writes into `builder`, which must outlive this writer."""
+        self._builder = builder
+
+    @always_inline
+    def write_string(mut self, string: StringSpan):
+        """Appends `string` to the builder's buffer."""
+        self._builder[]._append(string)

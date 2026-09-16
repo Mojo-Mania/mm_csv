@@ -7,7 +7,7 @@ scalar one. And regressions for the three bugs the ported implementation had,
 each written so it fails if the fix is taken out.
 """
 
-from mm_csv import CsvBuilder, CsvFields, CsvTable
+from mm_csv import CsvBuilder, CsvFields, CsvTable, to_csv
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
 
@@ -333,6 +333,167 @@ def test_round_trip() raises:
                 awkward[i],
                 String("simd=", simd, ": field ", i),
             )
+
+
+# ===-----------------------------------------------------------------------===#
+# Writing structs
+# ===-----------------------------------------------------------------------===#
+
+
+@fieldwise_init
+struct _Reading(Copyable):
+    var station: String
+    var hour: Int
+    var celsius: Float64
+    var checked: Bool
+
+
+@fieldwise_init
+struct _Point(Copyable, Writable):
+    var x: Int
+    var y: Int
+
+
+@fieldwise_init
+struct _Quoted(Copyable, Writable):
+    """Renders in three pieces, two of them quotes."""
+
+    var text: String
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write('"', self.text, '"')
+
+
+@fieldwise_init
+struct _Awkward(Copyable):
+    var point: _Point
+    var values: List[Int]
+    var quoted: _Quoted
+    var small: UInt8
+
+
+@fieldwise_init
+struct _Text(Copyable):
+    var text: String
+
+
+def test_to_csv_names_columns_after_fields() raises:
+    var readings: List[_Reading] = [
+        _Reading("north", 7, 12.5, True),
+        _Reading("south", 8, -3.0, False),
+    ]
+    assert_equal(
+        to_csv(readings),
+        (
+            "station,hour,celsius,checked\r\n"
+            "north,7,12.5,True\r\n"
+            "south,8,-3.0,False\r\n"
+        ),
+        "header from field names, a row per item",
+    )
+
+
+def test_to_csv_escapes_what_it_must() raises:
+    var readings: List[_Reading] = [
+        _Reading("has,comma", 1, 0.0, True),
+        _Reading('has"quote', 2, 0.0, True),
+        _Reading("has\r\nbreak", 3, 0.0, True),
+    ]
+    assert_equal(
+        to_csv(readings),
+        (
+            "station,hour,celsius,checked\r\n"
+            '"has,comma",1,0.0,True\r\n'
+            '"has""quote",2,0.0,True\r\n'
+            '"has\r\nbreak",3,0.0,True\r\n'
+        ),
+        "string fields",
+    )
+
+
+def test_to_csv_checks_what_it_cannot_know() raises:
+    """A field that is neither a string nor a number is rendered and checked.
+
+    `[1, 2]` holds a comma but no quote, and `_Quoted` renders quotes in
+    separate writes, so both ways of quoting in place are exercised.
+    """
+    var rows: List[_Awkward] = [
+        _Awkward(_Point(1, 2), [1, 2], _Quoted("q"), 255),
+        _Awkward(_Point(3, 4), [], _Quoted(""), 0),
+    ]
+    assert_equal(
+        to_csv(rows),
+        (
+            "point,values,quoted,small\r\n"
+            '"_Point(x=1, y=2)","[1, 2]","""q""",255\r\n'
+            '"_Point(x=3, y=4)",[],"""""",0\r\n'
+        ),
+        "rendered fields",
+    )
+
+
+def test_to_csv_with_a_header_and_a_separator() raises:
+    var readings: List[_Reading] = [_Reading("a,b", 1, 2.5, False)]
+    var header: List[String] = ["Station", "Hour (UTC)", "°C", "Checked?"]
+    assert_equal(
+        to_csv[separator=UInt8(ord("\t"))](readings, header^),
+        "Station\tHour (UTC)\t°C\tChecked?\r\na,b\t1\t2.5\tFalse\r\n",
+        "a comma is plain in a tab separated document",
+    )
+
+
+def test_to_csv_of_no_items() raises:
+    var none = List[_Reading]()
+    assert_equal(
+        to_csv(none), "station,hour,celsius,checked\r\n", "header only"
+    )
+
+
+def test_to_csv_round_trip() raises:
+    """What `to_csv` writes, `CsvTable` reads back."""
+    var awkward: List[String] = [
+        String("plain"),
+        "",
+        "with,comma",
+        'with"quote',
+        'both,"together',
+        "with\r\nbreak",
+        "α日本🎉",
+        '""',
+    ]
+    var rows = List[_Text]()
+    for i in range(len(awkward)):
+        rows.append(_Text(awkward[i]))
+    var table = CsvTable(to_csv(rows))
+    assert_equal(table.row_count(), len(awkward) + 1, "rows")
+    for i in range(len(awkward)):
+        assert_equal(table.get(i + 1, 0), awkward[i], String("row ", i))
+
+
+def test_push_value_quotes_in_place_across_buffer_growth() raises:
+    """Quoting after rendering must survive the buffer growing underneath.
+
+    The rendered value is shifted right to make room for the quotes, and that
+    room is reserved only once the value is already in the buffer. Every pad
+    here puts the end of the value at a different distance from a doubling,
+    so some of them grow the buffer in the middle of quoting.
+
+    As with `test_builder_buffer_boundaries`, this checks the content and not
+    the bounds: leaving out that reservation writes a few bytes past the
+    allocation, which reads back correctly and passes.
+    """
+    for pad in range(990, 1030):
+        var filler = String("")
+        for _ in range(pad):
+            filler += "f"
+        var builder = CsvBuilder(2)
+        builder.push(filler, escape=False)
+        builder.push_value(_Quoted("a,b"), escape=True)
+        var table = CsvTable(builder^.finish())
+        assert_equal(table.get(0, 0), filler, String("pad ", pad, ": filler"))
+        assert_equal(
+            table.get(0, 1), '"a,b"', String("pad ", pad, ": quoted value")
+        )
 
 
 # ===-----------------------------------------------------------------------===#

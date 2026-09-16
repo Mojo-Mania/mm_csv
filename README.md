@@ -126,6 +126,53 @@ rendered number can never need quoting and a string very well might. Turning
 it off means the value is written through unchecked: a separator or a quote
 slipping past makes a broken document.
 
+`push_value` renders straight into the document rather than through a
+`String`, and when `escape` is on and the rendered text needs quotes, it is
+quoted where it lies. On the Ryzen below that made it 1.34x faster for `Int`,
+1.46x for `Float64` and 1.95x for `Bool`.
+
+### Writing structs
+
+| | |
+| --- | --- |
+| `to_csv[separator](items)` | A document with a row per struct, headed by the field names. |
+| `to_csv[separator](items, header)` | The same under your own header, one name per field. |
+
+```mojo
+from mm_csv import to_csv
+
+@fieldwise_init
+struct Reading(Copyable):
+    var station: String
+    var hour: Int
+    var celsius: Float64
+
+var readings: List[Reading] = [
+    Reading("north, upper", 7, 12.5),
+    Reading("south", 8, -3.0),
+]
+print(to_csv(readings))
+# station,hour,celsius
+# "north, upper",7,12.5
+# south,8,-3.0
+```
+
+The columns come from compile-time reflection, so there is nothing to
+register and nothing is looked up while it runs: each field becomes one
+`push_value`. `items` is a `Span`, and a `List` converts.
+
+**Every field must be `Writable`.** A struct holding one that is not does not
+compile, rather than writing an empty column. A field of your own struct type
+is written through its `Writable` rendering, e.g. `Point(x=1, y=2)`.
+
+**Escaping is chosen per field type.** The integer and float scalars and
+`Bool` are written unchecked, because they can never render a separator or a
+quote. Everything else -- `String`, a `List`, your own types -- is rendered
+and checked, and quoted if it needs it.
+
+A `header` with the wrong number of names aborts, as a `CsvBuilder` with no
+columns does.
+
 ## Performance
 
 Measured on two machines, `-D ASSERT=none`, best of three runs. Reproduce with
@@ -345,7 +392,7 @@ left is in [`docs/improvements.md`](docs/improvements.md).
 ## Development
 
 ```bash
-pixi run test      # the test suite (26 tests)
+pixi run test      # the test suite (33 tests)
 pixi run main      # the example
 pixi run bench     # the tables above -- needs `bash data/setup.sh` first
 pixi run format    # mojo format
