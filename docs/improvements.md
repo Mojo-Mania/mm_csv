@@ -235,10 +235,10 @@ version, 17 against 42 -- but the group-of-four unrolling makes the scan
 region 3614 instructions where the plain one is 938. Whatever the overlap
 bought, it did not cover that.
 
-Neither is kept. Both are worth re-trying on x86, which is what simdcsv was
-tuned on, and which has now been measured but not with these: it reports buffering as its biggest win after
-the bitmask work, and that claim was measured on a different machine, a
-different compiler and a different instruction set.
+Neither is kept. simdcsv reports buffering as its biggest win after the
+bitmask work, but that was measured on x86 with a different compiler, so both
+were tried again there -- and lost again. See "Buffering and prefetching on
+x86: tried, neither wins" below.
 
 ### Re-profiled, and the index writes are now most of what is left
 
@@ -623,9 +623,82 @@ several of its intermediate `bits` values to the stack
 the first thing to measure, since the ARM profile put this walk at nearly half
 the scan.
 
-**Buffering and prefetching are untried here**, and x86 is where simdcsv found
-buffering worth the most. **simdcsv itself is unmeasured on x86**, so there is
-no gap to quote yet.
+**simdcsv itself is unmeasured on x86**, so there is no gap to quote yet.
+
+### Buffering and prefetching on x86: tried, neither wins
+
+x86 is what simdcsv was tuned on, and where it found buffering worth the most,
+so both were re-implemented on the AVX-512 path and measured the way the ARM
+attempt was: four builds of one source, selected with `-D` defines, best of 400
+parses, five rounds, microseconds. All four pass the 26 tests.
+
+- **Prefetch**: `prefetch(ptr + offset + 128)` once per chunk, simdcsv's
+  distance.
+- **Buffered**: the loop-carried part -- compares, prefix-XOR, the quote and
+  CR carries -- for four chunks into a `SIMD[DType.uint64, 4]` each of
+  delimiters, CRLF ends and row ends, then one capacity check and four emits.
+  simdcsv's shape.
+
+`no_escaping.csv`:
+
+| base | prefetch only | buffered only | both |
+| ---: | ---: | ---: | ---: |
+| 2447 | 2577 | 2506 | 2456 |
+| 2451 | 2577 | 2491 | 2468 |
+| 2475 | 2595 | 2470 | 2471 |
+| 2444 | 2605 | 2483 | 2455 |
+| 2462 | 2595 | 2489 | 2457 |
+
+`needs_escaping.csv`:
+
+| base | prefetch only | buffered only | both |
+| ---: | ---: | ---: | ---: |
+| 2582 | 2718 | 2614 | 2592 |
+| 2576 | 2712 | 2611 | 2590 |
+| 2580 | 2719 | 2616 | 2583 |
+| 2586 | 2715 | 2619 | 2589 |
+| 2583 | 2722 | 2594 | 2587 |
+
+Prefetching is 5% slower on both documents, every round. Buffering is 1-2%
+slower. Both together land level with the base, 0.3% behind -- the same
+ordering as on ARM, with smaller gaps.
+
+**Prefetching loses at every distance.** 128 bytes ahead is inside what a
+hardware prefetcher already covers on a sequential walk, so the distance was
+swept too, prefetch only, `no_escaping.csv`:
+
+| base | 128 | 1024 | 4096 | 16384 |
+| ---: | ---: | ---: | ---: | ---: |
+| 2454 | 2573 | 2593 | 2578 | 2661 |
+| 2447 | 2573 | 2578 | 2581 | 2633 |
+| 2468 | 2575 | 2567 | 2568 | 2646 |
+| 2451 | 2587 | 2583 | 2589 | 2656 |
+| 2465 | 2584 | 2581 | 2571 | 2709 |
+
+5% at anything up to a page, 8% at 16 KiB. The instruction costs something and
+there is nothing for it to do.
+
+**Buffering has nothing to overlap.** What it is for is letting the integer
+work of one chunk run while the next chunk's vector work, which depends on the
+previous quote state, is still in flight. So the thing to measure is what that
+dependency costs, and the ablation from the ARM budget answers it: set
+`carried_quote = 0` -- wrong answers, timing only -- and the chain is gone.
+
+| base | chain cut |
+| ---: | ---: |
+| 2455 | 2486 |
+| 2433 | 2496 |
+| 2457 | 2500 |
+| 2463 | 2492 |
+| 2450 | 2515 |
+
+Cutting it makes the scan 1.8% *slower*, which is codegen moving around, not a
+cost uncovered. On ARM it was worth 54 microseconds; on this core it is worth
+nothing measurable. Out-of-order execution already runs past it, and
+buffering pays for its restructuring with nothing to recover.
+
+Neither is kept. The experiment was a separate loop ahead of the committed one
+and is not in the tree.
 
 ## Streaming
 
