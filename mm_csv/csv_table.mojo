@@ -385,13 +385,20 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                 # Written out rather than put in a nested closure: a closure
                 # capturing `bits` forced it to memory and made the whole scan
                 # three times slower.
+                #
+                # The flag is arithmetic, not a conditional. Truncating to
+                # thirty-two bits and shifting left by thirty-one keeps bit
+                # zero and discards everything else, so no `& 1` is needed,
+                # and ARM folds the shift into the `orr` below. Written as
+                # `_CRLF_BIT if ... != 0 else 0` it was a test and a select
+                # instead, and cost 86 microseconds over this document.
                 var found = Int(pop_count(delimiters))
                 var bits = delimiters
                 comptime for j in range(0, 8):
                     var lane0 = Int(count_trailing_zeros(bits))
-                    var flag0 = Self._CRLF_BIT if (
-                        crlf >> UInt64(lane0)
-                    ) & 1 != 0 else UInt32(0)
+                    var flag0 = (crlf >> UInt64(lane0)).cast[
+                        DType.uint32
+                    ]() << 31
                     slots[unsafe_offset=written + j] = (
                         UInt32(offset + lane0) | flag0
                     )
@@ -399,9 +406,9 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                 if found > 8:
                     comptime for j in range(8, 16):
                         var lane8 = Int(count_trailing_zeros(bits))
-                        var flag8 = Self._CRLF_BIT if (
-                            crlf >> UInt64(lane8)
-                        ) & 1 != 0 else UInt32(0)
+                        var flag8 = (crlf >> UInt64(lane8)).cast[
+                            DType.uint32
+                        ]() << 31
                         slots[unsafe_offset=written + j] = (
                             UInt32(offset + lane8) | flag8
                         )
@@ -409,9 +416,9 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                 if found > 16:
                     comptime for j in range(16, 32):
                         var lane16 = Int(count_trailing_zeros(bits))
-                        var flag16 = Self._CRLF_BIT if (
-                            crlf >> UInt64(lane16)
-                        ) & 1 != 0 else UInt32(0)
+                        var flag16 = (crlf >> UInt64(lane16)).cast[
+                            DType.uint32
+                        ]() << 31
                         slots[unsafe_offset=written + j] = (
                             UInt32(offset + lane16) | flag16
                         )
@@ -419,9 +426,9 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                 if found > 32:
                     comptime for j in range(32, 64):
                         var lane32 = Int(count_trailing_zeros(bits))
-                        var flag32 = Self._CRLF_BIT if (
-                            crlf >> UInt64(lane32)
-                        ) & 1 != 0 else UInt32(0)
+                        var flag32 = (crlf >> UInt64(lane32)).cast[
+                            DType.uint32
+                        ]() << 31
                         slots[unsafe_offset=written + j] = (
                             UInt32(offset + lane32) | flag32
                         )

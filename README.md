@@ -138,25 +138,25 @@ fraction and field-length distribution. It prints the shape it produced.
 
 | | ms | MiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| parse, `simd=True` | **2.4** | **9226** | **1.2** |
-| parse, `simd=False` | 21.7 | 1014 | 10.6 |
-| read all, `field` (slice) | **1.6** | **13907** | **0.8** |
-| read all, `get` (String) | 24.0 | 917 | 11.7 |
-| stream, no index | 4.8 | 4537 | 2.4 |
-| build, `escape=False` | **17.5** | **1254** | **8.6** |
-| build, `escape=True` | 30.7 | 717 | 15.0 |
+| parse, `simd=True` | **2.3** | **9626** | **1.1** |
+| parse, `simd=False` | 22.3 | 988 | 10.9 |
+| read all, `field` (slice) | **1.6** | **14031** | **0.8** |
+| read all, `get` (String) | 23.7 | 929 | 11.6 |
+| stream, no index | 4.9 | 4469 | 2.4 |
+| build, `escape=False` | **17.7** | **1239** | **8.7** |
+| build, `escape=True` | 31.0 | 709 | 15.2 |
 
 **`needs_escaping.csv`** — 24.9 MB, 201 182 rows, 10 columns, 10% quoted:
 
 | | ms | MiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| parse, `simd=True` | **2.4** | **10015** | **1.2** |
-| parse, `simd=False` | 23.2 | 1024 | 11.5 |
-| read all, `field` (slice) | **1.6** | **14706** | **0.8** |
-| read all, `get` (String) | 32.8 | 723 | 16.3 |
-| stream, no index | 5.2 | 4596 | 2.6 |
-| build, `escape=False` | **17.5** | **1353** | **8.7** |
-| build, `escape=True` | 35.3 | 695 | 17.5 |
+| parse, `simd=True` | **2.3** | **10531** | **1.1** |
+| parse, `simd=False` | 23.8 | 999 | 11.8 |
+| read all, `field` (slice) | **1.6** | **15284** | **0.8** |
+| read all, `get` (String) | 32.5 | 731 | 16.1 |
+| stream, no index | 5.1 | 4615 | 2.6 |
+| build, `escape=False` | **17.6** | **1347** | **8.8** |
+| build, `escape=True` | 38.3 | 640 | 19.0 |
 
 Three things to read off these.
 
@@ -232,26 +232,29 @@ See [`docs/improvements.md`](docs/improvements.md).
 
 [simdcsv](https://github.com/geofflangdale/simdcsv) applies the simdjson
 techniques to RFC 4180. Its structural scan finds exactly the same delimiters
-on both documents — 2 042 888 and 2 011 820 — and it is **1.4x faster**.
+on both documents — 2 042 888 and 2 011 820 — and it is **1.36x faster**.
 Mean of 100 passes, GiB/s, both measured in one sitting:
 
 | | `no_escaping.csv` | `needs_escaping.csv` |
 | --- | ---: | ---: |
 | simdcsv, built with `-DCRLF` | **12.83** | **13.87** |
 | simdcsv, default build | 11.66 | 12.66 |
-| this | 8.94 | 9.52 |
+| this | 9.42 | 10.15 |
 
 An earlier version of this section claimed 1.16x. That was wrong, and not
 because anything regressed: the two sides had been measured at different
-moments and quietly compared. Measured together they are 1.30x apart against
-simdcsv's default build and 1.44x against its fastest.
+moments and quietly compared. Measured together it is 1.24x against simdcsv's
+default build and 1.36x against its fastest.
 
-**About 15% of the gap is a feature, and it is measured.** This index stores,
-in the top bit of every entry, whether the delimiter was an LF with a CR in
-front of it, which is what makes reading a field free of a byte compare.
-simdcsv stores a bare offset. Deleting that one flag from the emit takes the
-parse from 2285 to 1933 microseconds — 15% — and nothing else about the scan
-changes.
+**Most of the gap is a feature, and it is measured.** simdcsv's default build
+does not handle CRLF at all: it reports the LF position and leaves the CR
+sitting at the end of your field. This one finds the same delimiters *and*
+records, in the top bit of every entry, whether the delimiter was an LF with a
+CR in front of it, so reading a field needs no byte compare. That costs a
+fourth sixty-four lane comparison per chunk and three instructions per
+delimiter — **326 and 269 microseconds, 27% of a 2199 microsecond parse**.
+Two cheaper ways of getting it were tried and both were much worse; see
+[`docs/improvements.md`](docs/improvements.md).
 
 Everything simdcsv does differently has been adopted, and profiling then found
 three more things it does not do: one `UInt32` per field for the index,

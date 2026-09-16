@@ -427,6 +427,96 @@ on by default in its build and which it credits with 24%, were tried here and
 were 4% and 2.6% *slower* -- see above -- so whatever is left is not that
 either.
 
+## Closing the gap: one win, two losses, and a budget
+
+The re-measurement left 679 microseconds between this and simdcsv's fastest
+build. Ablating the real scan says where they are. Baseline 2285
+microseconds, best of 400 parses of `no_escaping.csv`:
+
+| removed | microseconds | costs |
+| --- | ---: | ---: |
+| baseline | 2285 | |
+| the compare-and-select in the CRLF flag | 2199 | **86** |
+| ...then the CRLF flag entirely | 1930 | **269** |
+| ...the carriage-return movemask | 1873 | **326** |
+| ...tracking the first row's column count | 2151 | 48 |
+| ...the loop-carried quote dependency | 2145 | 54 |
+| ...the per-chunk capacity check | 2178 | 21 |
+
+### The win: the flag is arithmetic, not a branch
+
+The emit used to build the flag with a conditional:
+
+```mojo
+var flag = Self._CRLF_BIT if (crlf >> UInt64(lane)) & 1 != 0 else UInt32(0)
+```
+
+which is a shift, a test, and a select. Shifting the bit into place instead
+says the same thing in two instructions, and ARM folds the second into the
+`orr` that was already there:
+
+```mojo
+var flag = (crlf >> UInt64(lane)).cast[DType.uint32]() << 31
+```
+
+The `& 1` is not needed: truncating to 32 bits and shifting left by 31 keeps
+bit 0 and nothing else. **86 microseconds, 3.8% of the parse**, for four
+lines.
+
+### The losses: two cheaper ways to find CRLF, both much worse
+
+A carriage return only matters immediately before a line feed, and this
+document has one row end to every eight delimiters. So a full sixty-four lane
+comparison for CR -- 326 microseconds -- looks like a lot to pay for
+information about 255 361 positions. Two ways to pay less:
+
+**Flag the slots afterwards.** Emit bare offsets, then walk the row-end bits,
+load the byte before each one, and `|=` the flag into the slot already
+written, finding it with `pop_count(delimiters & below)`. Correct -- all 26
+tests pass -- and **2786 microseconds**, 587 worse than the baseline it was
+meant to beat. Read-modify-write on memory written microseconds earlier is a
+store-to-forward stall, 255 361 times.
+
+**Build the mask first.** Same byte loads, but into a `crlf` mask before the
+emit runs, so the emit is unchanged and there is no read-modify-write.
+**2936 microseconds**, worse still. The loop over set bits has a trip count of
+zero, one or two and the branch predictor cannot learn it, so 360 224 chunks
+pay mispredicts to save a comparison that was branch-free.
+
+Both attempts lose to the same thing: a sixty-four lane SIMD comparison has no
+branches in it, and anything that replaces it with a loop over the few
+positions that matter pays more in mispredicts than the comparison cost in the
+first place. The CR movemask is not an overhead, it is the cheap way.
+
+A side benefit was given up with them. Reading the byte before each line feed
+straight from the document needs no `carried_cr` at all -- a CR and its LF may
+straddle a chunk boundary and the load does not care -- which would have
+deleted the exact piece of state whose tests did not bite for so long.
+
+### Things that turn out not to be worth doing
+
+**Packing with `select` instead of a multiply.** simdjson ANDs the all-ones
+comparison result with the bit weights where `_movemask` here casts to 0/1 and
+multiplies. Replacing the multiply with `m.select(weights, zeros)` measured
+2191-2200 against the baseline's 2199: no difference outside noise. The
+compiler was already lowering it well.
+
+**Software-pipelining the chunks.** Breaking the loop-carried quote dependency
+entirely -- `carried_quote = 0`, wrong answers, timing only -- is worth 54
+microseconds, 2.5%. Out-of-order execution is already hiding that chain, so
+buffering chunks to overlap it has almost nothing to win, which agrees with
+simdcsv's buffering and prefetch having measured slower here.
+
+### What is left
+
+At 2199 microseconds, with CRLF support costing 595 of them and the column
+count and capacity check another 69, the comparable figure against simdcsv's
+default build -- which does none of that -- is about 1861. simdcsv's default
+build runs 1870. **On the same work, the two are level.** The remaining
+distance to simdcsv's `-DCRLF` build, which does the fourth comparison and is
+somehow 10% faster than its own default build for an identical index, is not
+accounted for.
+
 ## Choosing the scan automatically
 
 `CsvTable` defaults to the vectorised scan, and the README's sweep shows that
