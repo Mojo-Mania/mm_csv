@@ -18,13 +18,21 @@ delimiters -- 2 042 888 in `no_escaping.csv`, matching commas plus line feeds
 | this, plus a bulk movemask and `pmull64` | **9.61 GB/s** | **10.37 GB/s** |
 
 Everything on that list has been done, and profiling then found three things
-it does not do. The gap is 1.16x rather than eleven.
+it does not do. **The 1.16x that column arithmetic implies is wrong** -- the
+rows were filled in at different sittings and compared as though they were
+not. See "Re-measured against simdcsv" below, which puts both sides on the
+same machine in the same minute and gets 1.30x to 1.44x.
 
 A caveat on that build: simdcsv's ARM path references `neonmovemask_bulk` and
 never defines it -- the README's promised ARM variant was never written -- so
 these numbers come from the algorithm with that one function supplied (the
 standard simdjson movemask) and `vmull_p64`'s return cast. The C++ measured is
-theirs; the ARM completion is not.
+theirs; the ARM completion is not. Built with:
+
+```bash
+clang++ -std=c++17 -O3 -mcpu=apple-m4+crypto -Isrc \
+  src/main.cpp src/io_util.cpp -o simdcsv
+```
 
 The gap looked like it split in two, and the first half turned out to be
 smaller than it looked.
@@ -263,6 +271,13 @@ on everything that is not storing and this spends 1768. The two
 implementations are within about 14% of each other on the work that is
 actually optional, and both are carrying the same ~525 us floor.
 
+**That paragraph rests on the 2077 us, and the 2077 us was stale.** Measured
+alongside, simdcsv runs this document in about 1870 us in its default build
+and 1720 us built with `-DCRLF`; see "Re-measured against simdcsv" below. The
+floor argument survives -- both still write the same two million indexes --
+but the optional work is 1345 to 1195 us for simdcsv against 1768 here, which
+is a gap of 30% to 48%, not 14%.
+
 Anything further, that note said, has to come from writing less rather than
 scanning faster, and it proposed two shapes. Both have since been built and
 measured. **Both are slower**, and the next three sections say why.
@@ -361,6 +376,56 @@ benchmark is what made the inconsistency visible.
 
 `field` is now `@always_inline`. Reading a whole document went from 3.5 ms to
 1.6 ms, and `get`, which calls it, from 26.6 ms to 24.0.
+
+## Re-measured against simdcsv, and the earlier 1.16x was wrong
+
+Every number above was taken when it was taken. Putting both sides on this
+machine in one sitting -- five runs each, mean of 100 passes, GiB/s, the same
+two documents, the same delimiter counts (2 042 888 and 2 011 820, which both
+implementations agree on exactly) -- gives this:
+
+| | `no_escaping.csv` | `needs_escaping.csv` |
+| --- | ---: | ---: |
+| simdcsv, built with `-DCRLF` | **12.83** | **13.87** |
+| simdcsv, default build | 11.66 | 12.66 |
+| this | 8.94 | 9.52 |
+
+So 1.30x against simdcsv's default build and 1.44x against its fastest, not
+1.16x. Nothing regressed: the scan is byte for byte what it was at the
+re-profile, and the same harness that reported 2293 microseconds then reports
+2285 now. What was wrong was the comparison, not either measurement.
+
+Two things about that table are worth keeping.
+
+**simdcsv is faster with `-DCRLF` than without it**, by 10%, reproducibly,
+interleaved runs. That build does a fourth comparison per chunk and computes
+`lf & cr_adjusted` where the default just takes `lf`, so it is strictly more
+work for an identical index on these documents. No explanation found; it is
+their code and their scheduling. It is reported as the baseline because it is
+the faster of the two and because it is the build that does the same job this
+one does.
+
+**The order of the runs matters.** A simdcsv run immediately after a Mojo
+process measured 8.92 GiB/s where five consecutive runs measured 11.63 to
+11.69. Interleaving the two implementations, which is the obvious way to be
+fair, is the way to get a contaminated number. Five consecutive runs of each,
+then compare.
+
+### Fifteen per cent of the gap is the CRLF flag
+
+This index stores in the top bit of every entry whether that delimiter was an
+LF with a CR in front of it, so that reading a field needs no byte compare.
+simdcsv stores a bare offset and has nothing to say about CRLF at access time.
+
+Deleting the flag from the emit -- storing `UInt32(offset + lane)` and nothing
+else, four unrolled groups, no other change -- takes the parse from **2285 to
+1933 microseconds**. That is 15% of the parse and roughly half the distance to
+simdcsv's default build, spent on a feature rather than lost to one.
+
+The rest is not accounted for. simdcsv's buffering and prefetching, which are
+on by default in its build and which it credits with 24%, were tried here and
+were 4% and 2.6% *slower* -- see above -- so whatever is left is not that
+either.
 
 ## Choosing the scan automatically
 

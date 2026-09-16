@@ -231,15 +231,35 @@ See [`docs/improvements.md`](docs/improvements.md).
 ## How it compares
 
 [simdcsv](https://github.com/geofflangdale/simdcsv) applies the simdjson
-techniques to RFC 4180, and on the same documents its structural scan finds
-exactly the same delimiters **1.16x faster** — 11.1 GB/s against our 9.6.
-Everything it does differently has been adopted, and then profiling found
-three more things it does not: one `UInt32` per field for the index, bitmask
-arithmetic over sixty-four bytes, an unrolled delimiter walk, a bulk movemask
-that crosses the register file once instead of sixteen times per chunk, and a
-carry-less multiply for the quote mask. Together those took parsing from 0.85
-to 9.6 GB/s, **11x** the ported implementation. What is left is in
-[`docs/improvements.md`](docs/improvements.md).
+techniques to RFC 4180. Its structural scan finds exactly the same delimiters
+on both documents — 2 042 888 and 2 011 820 — and it is **1.4x faster**.
+Mean of 100 passes, GiB/s, both measured in one sitting:
+
+| | `no_escaping.csv` | `needs_escaping.csv` |
+| --- | ---: | ---: |
+| simdcsv, built with `-DCRLF` | **12.83** | **13.87** |
+| simdcsv, default build | 11.66 | 12.66 |
+| this | 8.94 | 9.52 |
+
+An earlier version of this section claimed 1.16x. That was wrong, and not
+because anything regressed: the two sides had been measured at different
+moments and quietly compared. Measured together they are 1.30x apart against
+simdcsv's default build and 1.44x against its fastest.
+
+**About 15% of the gap is a feature, and it is measured.** This index stores,
+in the top bit of every entry, whether the delimiter was an LF with a CR in
+front of it, which is what makes reading a field free of a byte compare.
+simdcsv stores a bare offset. Deleting that one flag from the emit takes the
+parse from 2285 to 1933 microseconds — 15% — and nothing else about the scan
+changes.
+
+Everything simdcsv does differently has been adopted, and profiling then found
+three more things it does not do: one `UInt32` per field for the index,
+bitmask arithmetic over sixty-four bytes, an unrolled delimiter walk, a bulk
+movemask that crosses the register file once instead of sixteen times per
+chunk, and a carry-less multiply for the quote mask. Together those took
+parsing from 0.89 to 8.94 GiB/s, **10x** the ported implementation. What is
+left is in [`docs/improvements.md`](docs/improvements.md).
 
 ## Development
 
