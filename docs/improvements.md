@@ -195,20 +195,46 @@ allocation. Nothing in the test suite was dense enough to catch it.
 `test_far_more_delimiters_than_the_index_was_sized_for` is, and it crashes if
 the check is removed.
 
+### Chunk buffering and prefetching: tried, both slower
+
+These were the last two things simdcsv does that this did not. Both were
+implemented and both lost, on this machine, measured four ways against the
+same binary harness -- best of 400 parses, five rounds, microseconds:
+
+| base | prefetch only | buffered only | both |
+| ---: | ---: | ---: | ---: |
+| 2291 | 2380 | 2347 | 2332 |
+| 2292 | 2376 | 2347 | 2334 |
+| 2288 | 2373 | 2348 | 2329 |
+| 2286 | 2378 | 2345 | 2325 |
+| 2287 | 2381 | 2350 | 2330 |
+
+Prefetching is 4% slower, buffering 2.6%, and the two together 1.9% -- every
+round, no overlap between the distributions.
+
+**Prefetching** adds one `prfm` per chunk to a walk that is already purely
+sequential. The hardware prefetcher needs no help with that, and the
+instruction is not free.
+
+**Buffering** computes four chunks' masks into small arrays before flattening
+any of them, so the vector-heavy and integer-heavy halves can overlap. It did
+not spill -- the disassembly has *fewer* stack references than the unbuffered
+version, 17 against 42 -- but the group-of-four unrolling makes the scan
+region 3614 instructions where the plain one is 938. Whatever the overlap
+bought, it did not cover that.
+
+Neither is kept. Both are worth re-trying if this is ever built for x86, which
+is what simdcsv was tuned on: it reports buffering as its biggest win after
+the bitmask work, and that claim was measured on a different machine, a
+different compiler and a different instruction set.
+
 ### What is left
 
-simdcsv is 1.16x ahead, 11.1 GB/s against 9.6. Two things it does that this
-does not:
-
-- **Buffering.** It processes four chunks into a small array of masks before
-  flattening any of them, for pipelining, and reports that as its single
-  biggest win after the bitmask work itself.
-- **Prefetching.** `__builtin_prefetch(buf + idx + 128)` on every chunk.
-
-Neither has been tried. The scan should also be re-profiled: the last
-breakdown was taken before the bulk movemask and the carry-less multiply, both
-of which cut the phase that was then largest, so it no longer describes where
-the time goes.
+simdcsv is 1.16x ahead, 11.1 GB/s against 9.6, and nothing on its list remains
+untried. The scan also wants re-profiling before anything else is attempted:
+the last breakdown predates the bulk movemask and the carry-less multiply,
+both of which cut the phase that was largest when it was taken, so it no
+longer describes where the time goes.
 
 ## Choosing the scan automatically
 
