@@ -541,7 +541,7 @@ short fields -- by 12% at two bytes, and on both real documents -- and that
 picking a scan per document needed a better predictor than mean field length.
 That was true of the sixteen-byte `compressed_store` scan it measured. The
 bitmask scan that replaced it wins at every field width measured, on both
-machines: 1.6x to 8.9x on the M4, 2.1x to 12.6x on x86. There is no losing case
+machines: 2.0x to 8.9x on the M4, 4.7x to 15x on x86. There is no losing case
 left to predict, so `simd=True` stays the unconditional default.
 
 The same rewrite answered the question the next section here used to ask --

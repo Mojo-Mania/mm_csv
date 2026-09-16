@@ -51,7 +51,7 @@ nothing. `is_quoted` tells you whether the difference matters for a given
 field.
 
 **Leave the SIMD scan on.** It is the default and it wins at every field width
-measured, on both machines: from 1.6x on two-byte fields to 8.9x on 256-byte
+measured, on both machines: from 2.0x on two-byte fields to 8.9x on 256-byte
 ones on an Apple M4, and from 4.7x to 15x on x86. The scalar walk is kept as
 the reference implementation the tests compare against, not as an option you
 are meant to need.
@@ -240,20 +240,18 @@ the line feeds that follow, so one AND finds the CRLF row ends. What is left
 is walked with count-trailing-zeros, once per delimiter rather than once per
 byte.
 
-It wins at every field width measured. On the M4 -- measured one change
-earlier than the tables above, before the CRLF flag became arithmetic, so the
-simd column may now be slightly low:
+It wins at every field width measured. On the M4:
 
 | mean field bytes | scalar ms | simd ms | simd wins by |
 | ---: | ---: | ---: | ---: |
-| 2 | 6.9 | **4.3** | 1.62x |
-| 4 | 6.4 | **1.8** | 3.54x |
-| 8 | 5.5 | **1.1** | 4.81x |
-| 16 | 6.2 | **1.1** | 5.58x |
-| 32 | 6.1 | **1.1** | 5.39x |
-| 64 | 6.5 | **1.1** | 5.77x |
-| 128 | 6.7 | **0.8** | 8.50x |
-| 256 | 6.4 | **0.7** | 8.85x |
+| 2 | 6.9 | **3.3** | 2.11x |
+| 4 | 6.2 | **1.6** | 3.87x |
+| 8 | 6.1 | **1.1** | 5.77x |
+| 16 | 6.1 | **1.1** | 5.78x |
+| 32 | 6.0 | **1.0** | 5.79x |
+| 64 | 6.4 | **1.1** | 5.87x |
+| 128 | 6.6 | **0.8** | 8.02x |
+| 256 | 6.3 | **0.7** | 8.94x |
 
 On the Ryzen AI 9 HX 370:
 
@@ -269,7 +267,7 @@ On the Ryzen AI 9 HX 370:
 | 256 | 5.5 | **0.4** | 14.61x |
 
 The scalar column is the noisy one -- it moves about 10% between runs, and the
-two-byte row has been seen anywhere from 1.25x to 1.62x on the M4. The shape
+two-byte row went from 2.00x to 2.12x across three runs on the M4. The shape
 does not move: the win grows with field length and never disappears.
 
 That was not true of the first version of this scan, which looked at sixteen
