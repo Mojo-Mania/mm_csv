@@ -57,6 +57,35 @@ sixteen-lane path lowered to sixteen of each, reassembled with `vpinsrw`, and
 this is 1.69x faster on the whole parse. See `docs/improvements.md`."""
 
 
+comptime _COMPRESS_EMIT = CompilationTarget._has_feature["avx512vbmi2"]()
+"""Whether to write a chunk's index entries with `vpcompressb` rather than
+walking its delimiter bits.
+
+The unrolled walk is a serial chain -- each `bits &= bits - 1` waits on the
+last -- and on AVX-512 LLVM vectorises everything after it, which means
+computing the links, spilling them to the stack, and gathering them back into
+a `zmm`. A compress has no chain: every delimiter's lane comes out of one
+instruction. 2.2x on the whole parse. See `docs/improvements.md`."""
+
+
+comptime _LANES = iota[DType.uint8, 64]()
+"""Every lane index of a chunk, for the compress to pick from."""
+
+
+@always_inline
+def _unpack_bits(bits: UInt64) -> SIMD[DType.bool, 64]:
+    """The inverse of `pack_bits`: one lane per bit.
+
+    `bitcast` counts a `bool` as eight bits and refuses; `pack_bits` is a raw
+    `pop.bitcast`, and so is this, the other way round.
+    """
+    return SIMD[DType.bool, 64](
+        mlir_value=__mlir_op.`pop.bitcast`[
+            _type=SIMD[DType.bool, 64]._mlir_type
+        ](bits._mlir_value)
+    )
+
+
 comptime _HALF_COMPARE = CompilationTarget.has_avx2()
 """Whether to compare a chunk thirty-two bytes at a time, where there is AVX2
 but no AVX-512BW: two `vpmovmskb`s a mask instead of four. Checked after
@@ -449,60 +478,94 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                     self._reserve(self._capacity * 2 + _SLACK)
                     slots = self._slots
 
-                # Unrolled. The profile said this loop was nearly half the
-                # scan, most of it a branch per delimiter; groups of eight
-                # replace up to sixty-four of those branches with three.
-                # Written out rather than put in a nested closure: a closure
-                # capturing `bits` forced it to memory and made the whole scan
-                # three times slower.
-                #
-                # The flag is arithmetic, not a conditional. Truncating to
-                # thirty-two bits and shifting left by thirty-one keeps bit
-                # zero and discards everything else, so no `& 1` is needed,
-                # and ARM folds the shift into the `orr` below. Written as
-                # `_CRLF_BIT if ... != 0 else 0` it was a test and a select
-                # instead, and cost 86 microseconds over this document.
                 var found = Int(pop_count(delimiters))
-                var bits = delimiters
-                comptime for j in range(0, 8):
-                    var lane0 = Int(count_trailing_zeros(bits))
-                    var flag0 = (crlf >> UInt64(lane0)).cast[
-                        DType.uint32
-                    ]() << 31
-                    slots[unsafe_offset=written + j] = (
-                        UInt32(offset + lane0) | flag0
+                comptime if _COMPRESS_EMIT:
+                    # One `vpcompressb` packs the lane of every delimiter to
+                    # the front, in order, with that delimiter's CRLF flag
+                    # riding in bit 7 -- lanes stop at 63, so it is free.
+                    # Then sixteen at a time: widen, add the chunk offset,
+                    # move the flag to bit 31, store. Only the first store is
+                    # unconditional; eleven-byte fields put five or six
+                    # delimiters in a chunk, and storing all four groups
+                    # regardless measured 1.7x slower than guarding them.
+                    var marked = _LANES | _unpack_bits(crlf).select(
+                        SIMD[DType.uint8, 64](128), SIMD[DType.uint8, 64](0)
                     )
-                    bits &= bits - 1
-                if found > 8:
-                    comptime for j in range(8, 16):
-                        var lane8 = Int(count_trailing_zeros(bits))
-                        var flag8 = (crlf >> UInt64(lane8)).cast[
+                    var packed = llvm_intrinsic[
+                        "llvm.x86.avx512.mask.compress", SIMD[DType.uint8, 64]
+                    ](
+                        marked,
+                        SIMD[DType.uint8, 64](0),
+                        _unpack_bits(delimiters),
+                    )
+                    var base = SIMD[DType.uint32, 16](UInt32(offset))
+                    var w0 = packed.slice[16]().cast[DType.uint32]()
+                    slots.unsafe_store[width=16](
+                        written, ((w0 & 127) + base) | ((w0 >> 7) << 31)
+                    )
+                    comptime for g in range(1, 4):
+                        if found > g * 16:
+                            var w = packed.slice[16, offset=g * 16]().cast[
+                                DType.uint32
+                            ]()
+                            slots.unsafe_store[width=16](
+                                written + g * 16,
+                                ((w & 127) + base) | ((w >> 7) << 31),
+                            )
+                else:
+                    # Unrolled. The profile said this loop was nearly half the
+                    # scan, most of it a branch per delimiter; groups of eight
+                    # replace up to sixty-four of those branches with three.
+                    # Written out rather than put in a nested closure: a closure
+                    # capturing `bits` forced it to memory and made the whole scan
+                    # three times slower.
+                    #
+                    # The flag is arithmetic, not a conditional. Truncating to
+                    # thirty-two bits and shifting left by thirty-one keeps bit
+                    # zero and discards everything else, so no `& 1` is needed,
+                    # and ARM folds the shift into the `orr` below. Written as
+                    # `_CRLF_BIT if ... != 0 else 0` it was a test and a select
+                    # instead, and cost 86 microseconds over this document.
+                    var bits = delimiters
+                    comptime for j in range(0, 8):
+                        var lane0 = Int(count_trailing_zeros(bits))
+                        var flag0 = (crlf >> UInt64(lane0)).cast[
                             DType.uint32
                         ]() << 31
                         slots[unsafe_offset=written + j] = (
-                            UInt32(offset + lane8) | flag8
+                            UInt32(offset + lane0) | flag0
                         )
                         bits &= bits - 1
-                if found > 16:
-                    comptime for j in range(16, 32):
-                        var lane16 = Int(count_trailing_zeros(bits))
-                        var flag16 = (crlf >> UInt64(lane16)).cast[
-                            DType.uint32
-                        ]() << 31
-                        slots[unsafe_offset=written + j] = (
-                            UInt32(offset + lane16) | flag16
-                        )
-                        bits &= bits - 1
-                if found > 32:
-                    comptime for j in range(32, 64):
-                        var lane32 = Int(count_trailing_zeros(bits))
-                        var flag32 = (crlf >> UInt64(lane32)).cast[
-                            DType.uint32
-                        ]() << 31
-                        slots[unsafe_offset=written + j] = (
-                            UInt32(offset + lane32) | flag32
-                        )
-                        bits &= bits - 1
+                    if found > 8:
+                        comptime for j in range(8, 16):
+                            var lane8 = Int(count_trailing_zeros(bits))
+                            var flag8 = (crlf >> UInt64(lane8)).cast[
+                                DType.uint32
+                            ]() << 31
+                            slots[unsafe_offset=written + j] = (
+                                UInt32(offset + lane8) | flag8
+                            )
+                            bits &= bits - 1
+                    if found > 16:
+                        comptime for j in range(16, 32):
+                            var lane16 = Int(count_trailing_zeros(bits))
+                            var flag16 = (crlf >> UInt64(lane16)).cast[
+                                DType.uint32
+                            ]() << 31
+                            slots[unsafe_offset=written + j] = (
+                                UInt32(offset + lane16) | flag16
+                            )
+                            bits &= bits - 1
+                    if found > 32:
+                        comptime for j in range(32, 64):
+                            var lane32 = Int(count_trailing_zeros(bits))
+                            var flag32 = (crlf >> UInt64(lane32)).cast[
+                                DType.uint32
+                            ]() << 31
+                            slots[unsafe_offset=written + j] = (
+                                UInt32(offset + lane32) | flag32
+                            )
+                            bits &= bits - 1
                 written += found
 
             offset += CHUNK
