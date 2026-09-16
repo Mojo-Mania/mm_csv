@@ -37,11 +37,11 @@ makes reading free; it also means the document has to fit in memory.
 
 **Index first, stream only for a reason.** `CsvFields` walks the same chunks
 without writing an index, which sounds like it should be the faster way to
-read a document once. Measured, it is **not faster**: 20% slower than building
-the index and walking it on an Apple M4, level with it on x86, for reasons in
-the performance section. What it buys is the
-four bytes a field that the index costs -- 8 MB on a 23 MB document -- and
-freedom from the 2 GiB ceiling, because its offsets are full-width integers.
+read a document once. Measured, it is **slower**: 20% slower than building
+the index and walking it on an Apple M4 and 50-60% slower on x86, for reasons
+in the performance section. What it buys is the four bytes a field that the
+index costs -- 8 MB on a 23 MB document -- and freedom from the 2 GiB ceiling,
+because its offsets are full-width integers.
 Take it when the memory matters or the document is enormous; otherwise take
 `CsvTable`.
 
@@ -52,9 +52,9 @@ field.
 
 **Leave the SIMD scan on.** It is the default and it wins at every field width
 measured, on both machines: from 1.6x on two-byte fields to 8.9x on 256-byte
-ones on an Apple M4, and from 2.1x to 11-13x on x86. The scalar walk
-is kept as the reference implementation the tests compare against, not as an
-option you are meant to need.
+ones on an Apple M4, and from 4.7x to 15x on x86. The scalar walk is kept as
+the reference implementation the tests compare against, not as an option you
+are meant to need.
 
 **Documents must be under 2 GiB.** Field positions are indexed with 31 bits
 and a flag; a larger document aborts with a message saying so. `CsvFields` has
@@ -166,37 +166,43 @@ Two runs agreeing to within 6%.
 
 ### AMD Ryzen AI 9 HX 370
 
-AVX-512, Linux, Mojo 1.2.0.dev2026091505. Three runs agreeing to within 2%.
+AVX-512 with VBMI2, Linux, Mojo 1.2.0.dev2026091505. Three runs; all agree to
+within 2% except the `needs_escaping.csv` parse, where one run measured 18 620
+MiB/s and the other two about 17 300.
 
 **`no_escaping.csv`**:
 
 | | ms | MiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| parse, `simd=True` | **2.6** | **8546** | **1.3** |
-| parse, `simd=False` | 21.4 | 1027 | 10.5 |
-| read all, `field` (slice) | **1.5** | **14975** | **0.7** |
-| read all, `get` (String) | 24.3 | 907 | 11.9 |
-| stream, no index | 4.1 | 5390 | 2.0 |
-| build, `escape=False` | **20.3** | **1086** | **9.9** |
-| build, `escape=True` | 37.3 | 589 | 18.3 |
+| parse, `simd=True` | **1.3** | **17434** | **0.6** |
+| parse, `simd=False` | 21.1 | 1042 | 10.3 |
+| read all, `field` (slice) | **1.5** | **14873** | **0.7** |
+| read all, `get` (String) | 24.1 | 911 | 11.8 |
+| stream, no index | 4.1 | 5361 | 2.0 |
+| build, `escape=False` | **20.2** | **1089** | **9.9** |
+| build, `escape=True` | 37.6 | 585 | 18.4 |
 
 **`needs_escaping.csv`**:
 
 | | ms | MiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| parse, `simd=True` | **2.7** | **8815** | **1.3** |
-| parse, `simd=False` | 23.2 | 1023 | 11.5 |
-| read all, `field` (slice) | **1.4** | **16535** | **0.7** |
-| read all, `get` (String) | 26.1 | 910 | 13.0 |
-| stream, no index | 4.2 | 5592 | 2.1 |
-| build, `escape=False` | **21.6** | **1099** | **10.7** |
+| parse, `simd=True` | **1.3** | **18620** | **0.6** |
+| parse, `simd=False` | 25.0 | 951 | 12.4 |
+| read all, `field` (slice) | **1.4** | **16501** | **0.7** |
+| read all, `get` (String) | 26.2 | 906 | 13.0 |
+| stream, no index | 4.3 | 5547 | 2.1 |
+| build, `escape=False` | **21.7** | **1096** | **10.8** |
 | build, `escape=True` | 40.0 | 613 | 19.9 |
 
-Parsing is 11-16% behind the M4 and writing 4-17% behind; reading through
-`field` is 7-8% ahead, and streaming 20% ahead. Before the scan had x86 paths
-of its own it parsed at 4.4 GiB/s here -- half this -- because it was running
-the portable fallback; see [`docs/improvements.md`](docs/improvements.md). An
-AVX2 build without AVX-512 parses `no_escaping.csv` in 2.8 ms.
+Parsing is **1.8x ahead of the M4**, 17.0 and 18.2 GiB/s, because x86 with
+AVX-512 VBMI2 writes the index with `vpcompressb` and ARM has no equivalent
+instruction. Reading through `field` is 6-8% ahead and streaming 20% ahead;
+writing is 4-19% behind. The history on this machine: the scan parsed at 4.4
+GiB/s while it was running the portable fallback, 8.3-8.6 once it had x86
+compares and `pclmulqdq`, and this with the compress; see
+[`docs/improvements.md`](docs/improvements.md). A build without VBMI2 keeps the
+unrolled walk and parses `no_escaping.csv` in about 2.5 ms; one with AVX2 only,
+in 2.8.
 
 ### Reading the tables
 
@@ -207,12 +213,13 @@ quoted fields at all, `get` still costs 14x more, because it still allocates.
 
 **Not building the index costs as much as building it, or more.** On the M4,
 parsing and then walking every field is 2.3 + 1.6 = 3.9 ms; streaming the same
-fields with no index at all is 4.9. On x86 the two are level, 4.0 against 4.1
-ms. The reason is that the index is written by an unrolled loop that emits eight offsets per chunk whether or not eight delimiters are
-there, because writing a few junk entries into slack is free -- no branch per
-delimiter anywhere. A consumer cannot be handed junk fields, so `CsvFields`
-has to test and branch once per field, and that branch costs more than the
-store it avoids. Reading the index back afterwards is then a flat,
+fields with no index at all is 4.9. On x86 it is 1.3 + 1.5 = 2.8 against 4.1.
+The reason is that the index is written in groups -- eight offsets per chunk
+from the unrolled walk, sixteen from the compress -- whether or not that many
+delimiters are there, because writing a few junk entries into slack is free,
+and there is no branch per delimiter anywhere. A consumer cannot be handed
+junk fields, so `CsvFields` has to test and branch once per field, and that
+branch costs more than the store it avoids. Reading the index back afterwards is then a flat,
 predictable pass. Streaming is the right choice for the memory it saves, not
 for speed.
 
@@ -252,14 +259,14 @@ On the Ryzen AI 9 HX 370:
 
 | mean field bytes | scalar ms | simd ms | simd wins by |
 | ---: | ---: | ---: | ---: |
-| 2 | 6.7 | **3.2** | 2.07x |
-| 4 | 5.7 | **1.6** | 3.59x |
-| 8 | 5.3 | **1.3** | 4.05x |
-| 16 | 5.0 | **1.3** | 3.91x |
-| 32 | 4.9 | **1.3** | 3.84x |
-| 64 | 5.2 | **1.3** | 4.06x |
-| 128 | 5.8 | **0.7** | 8.14x |
-| 256 | 5.5 | **0.4** | 12.62x |
+| 2 | 6.3 | **1.3** | 4.68x |
+| 4 | 5.6 | **0.8** | 6.66x |
+| 8 | 4.9 | **0.7** | 7.53x |
+| 16 | 4.9 | **0.6** | 7.63x |
+| 32 | 4.8 | **0.7** | 7.39x |
+| 64 | 5.4 | **0.7** | 8.28x |
+| 128 | 5.5 | **0.5** | 11.99x |
+| 256 | 5.5 | **0.4** | 14.61x |
 
 The scalar column is the noisy one -- it moves about 10% between runs, and the
 two-byte row has been seen anywhere from 1.25x to 1.62x on the M4. The shape
@@ -287,7 +294,15 @@ chunk is one 64-lane comparison and each mask comes out with one `kmovq`; with
 only AVX2 it is two 32-lane halves and a `vpmovmskb` each. The prefix-XOR is one
 `pclmulqdq`. Together those made parsing 1.81x faster on AVX-512 and 1.38x on
 AVX2, against the portable path both were using before. Anything with neither
-NEON nor AVX2 still gets the portable code. See
+NEON nor AVX2 still gets the portable code.
+
+And with AVX-512 VBMI2 the delimiter walk goes away. The unrolled walk is a
+serial chain -- each `bits &= bits - 1` waits on the one before -- and on
+AVX-512 LLVM vectorises everything after it, so the links were computed in
+scalar code, spilled to the stack, and gathered back into a `zmm`. Instead, one
+`vpcompressb` packs every delimiter's lane index to the front of a vector, with
+its CRLF flag in bit 7, and those are widened and stored sixteen at a time.
+That is **2.2x** on the whole parse. See
 [`docs/improvements.md`](docs/improvements.md).
 
 ## How it compares
@@ -296,7 +311,9 @@ NEON nor AVX2 still gets the portable code. See
 techniques to RFC 4180. Its structural scan finds exactly the same delimiters
 on both documents — 2 042 888 and 2 011 820 — and it is **1.36x faster**.
 Mean of 100 passes, GiB/s, both measured in one sitting on the Apple M4 Max.
-simdcsv has not been measured on x86 here:
+simdcsv has not been measured on x86 here, so the `vpcompressb` path has no
+comparison yet -- its numbers on the Ryzen are higher than any in this table,
+but that is two machines, which is exactly the mistake described below:
 
 | | `no_escaping.csv` | `needs_escaping.csv` |
 | --- | ---: | ---: |

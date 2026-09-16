@@ -328,6 +328,13 @@ against 4.25 on `needs_escaping.csv`. Level, not faster. The branch per field
 is evidently cheaper on that core, but it still does not buy back more than
 the stores cost.
 
+That lasted one commit. Once the x86 emit became a `vpcompressb` -- see "The
+emit on x86: no chain, one compress" -- indexing and walking is 2.74 ms
+against 4.10 on `no_escaping.csv`, and 2.71 against 4.28 on
+`needs_escaping.csv`. Streaming is 50-60% slower there, and the reason is
+sharper than on ARM: the index got a branch-free, chain-free writer, and
+`CsvFields`, which has to hand fields out one at a time, cannot use it.
+
 ### Narrowing the index: tried, and slower
 
 Three bytes a slot does **not** address a 16 MiB document, as the note above
@@ -611,20 +618,6 @@ Parsing is now 8.3-8.6 GiB/s on x86, from 4.4, against 9.4-10.3 on the M4.
 Across the field-width sweep the simd column improved 1.4x at two-byte fields
 and 2x to 3.3x everywhere else.
 
-### What is left on x86
-
-**The sweep is still flat**, at 1.3 ms from eight-byte fields to sixty-four,
-which is still about 7 ns a chunk of fixed cost. With packing down to four
-`kmovq`s that is no longer obviously the packing.
-
-**The emit spills.** In the disassembly the unrolled delimiter walk stores
-several of its intermediate `bits` values to the stack
-(`mov QWORD PTR [rsp+...]`) rather than keeping them in registers. That is
-the first thing to measure, since the ARM profile put this walk at nearly half
-the scan.
-
-**simdcsv itself is unmeasured on x86**, so there is no gap to quote yet.
-
 ### Buffering and prefetching on x86: tried, neither wins
 
 x86 is what simdcsv was tuned on, and where it found buffering worth the most,
@@ -699,6 +692,117 @@ buffering pays for its restructuring with nothing to recover.
 
 Neither is kept. The experiment was a separate loop ahead of the committed one
 and is not in the tree.
+
+### The emit on x86: no chain, one compress
+
+On AVX-512 the unrolled walk did not compile to the loop it looks like. The
+disassembly of one group of eight, abridged -- the chain and spill lines are
+interleaved in the real listing:
+
+```
+blsr   rdx,r14                  ; the chain: bits &= bits - 1
+lea    rcx,[rdx-0x2]
+and    rcx,rdx
+mov    QWORD PTR [rsp+0xa0],rcx ; each link spilled
+...
+vmovq  xmm3,QWORD PTR [rsp+0xa0] ; and reloaded
+vpunpcklqdq xmm2,xmm4,xmm3      ; gathered into a zmm
+vinserti128 ymm1,ymm2,xmm1,0x1
+vpaddq ymm2,ymm1,ymm2            ; lowest set bit, eight at once
+vpandn ymm1,ymm1,ymm2
+vpopcntq ymm3,ymm1               ; = count-trailing-zeros
+vpsrlvq zmm1,zmm0,zmm3           ; CRLF flag
+vpmovqd ymm1,zmm1
+vmovdqu YMMWORD PTR [r9+r13*4],ymm2 ; eight offsets, one store
+```
+
+LLVM's SLP vectoriser took everything after the chain -- count-trailing-zeros
+as `vpopcntq((x - 1) & ~x)`, the flag shift, the narrowing, the store -- and
+did it eight lanes at a time. The chain itself cannot be vectorised: each link
+is the previous one with its lowest bit cleared. So it runs in scalar code, all
+its links have to be alive at once to be gathered, there are more of them than
+free registers, and they go to the stack. The spills were a symptom of the
+gather, and the gather was about twenty instructions per eight offsets.
+
+**It was not the call.** The capacity check sits between the masks and the
+walk, and it calls `_reserve`, so anything live across it must be saved.
+Moving the check to the top of the chunk, where nothing is live, took the stack
+references in the scan from 171 to 157 and the parse from 2455 to 2807
+microseconds -- 15% *slower*.
+
+**The fix is not having a chain.** AVX-512 VBMI2 has `vpcompressb`, which
+takes a byte vector and a mask and packs the selected bytes to the front, in
+order, in one instruction. Compress `iota[DType.uint8, 64]()` by the delimiter
+mask and the result is every delimiter's lane, already in order. The CRLF flag
+rides along in bit 7 -- lanes stop at 63, so the bit is free -- by ORing
+`0x80` into the lanes where `crlf` is set before compressing. Then sixteen at
+a time: zero-extend to `UInt32`, `& 127` and add the chunk offset, shift bit 7
+up to bit 31, store sixteen.
+
+Getting a `SIMD[DType.bool, 64]` from the `UInt64` mask needed a function the
+stdlib does not have. `bitcast` refuses, because it counts a `bool` as eight
+bits; `pack_bits` is a raw `pop.bitcast` from bools to an integer, so
+`_unpack_bits` is the same op the other way.
+
+Best of 400 parses, five rounds:
+
+| | `no_escaping.csv` microseconds | |
+| --- | ---: | ---: |
+| unrolled walk | 2443-2465 | |
+| compress, all four stores every chunk | 1869-1881 | 1.31x |
+| **compress, stores two to four guarded** | **1093-1125** | **2.21x** |
+
+**Guarding the stores is worth 1.7x on its own.** Five or six delimiters a
+chunk fit in the first sixteen, and `if found > 16` is a well-predicted
+branch; storing all 256 bytes regardless costs far more than the branches
+it saves. That is the opposite of the unrolled walk's lesson -- where writing
+junk past the count was the win -- and the difference is size: eight 4-byte
+junk writes against 192 bytes of them.
+
+The field-width sweep, simd column, before and after:
+
+| mean field bytes | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| unrolled walk, ms | 3.2 | 1.6 | 1.3 | 1.3 | 1.3 | 1.3 | 0.7 | 0.4 |
+| compress, ms | **1.3** | **0.8** | **0.7** | **0.6** | **0.7** | **0.7** | **0.5** | **0.4** |
+
+The biggest win is on two-byte fields, where the chain was longest: 2.5x.
+The full benchmark puts parsing at 17 434 and 18 620 MiB/s on the two
+documents, 17.0 and 18.2 GiB/s, from 8.3 and 8.6.
+
+It is behind `_COMPRESS_EMIT`, which asks for `avx512vbmi2`. Checked:
+
+- the 26 tests with the host's features, and with VBMI2, AVX-512, AVX2 and
+  `pclmul` switched off in turn, with only the host build containing
+  `vpcompressb`;
+- every field of both real documents against the scalar scan, in each of those
+  builds;
+- 9 576 dense synthetic documents -- up to sixty-four delimiters a chunk, CR,
+  CRLF and quoted separators, at every alignment -- field by field, start and
+  end, which is what exercises the guarded stores and the flag;
+- an `aarch64-apple-darwin` build for `apple-m4`, unchanged apart from the
+  source location in one abort message.
+
+**One side effect:** the *scalar* parse of `needs_escaping.csv` measures about
+8% slower in the same binary, 25.0 ms against 23.2, in every run since. Its
+source did not change. It is the reference implementation, not a path anyone
+is meant to use, so this is recorded rather than chased.
+
+### What is left on x86
+
+**AVX-512 without VBMI2 still walks.** Skylake-X and Cascade Lake have
+AVX-512F and BW but not VBMI2, and fall back to the unrolled walk at about
+2.5 ms. `vpcompressd`, which is AVX-512F, could do the same job on four
+sixteen-lane `UInt32` vectors. It can be built and checked here with
+`--target-features=-avx512vbmi2`, but not measured on a chip that lacks it.
+
+**AVX2 has no compress.** The usual substitute is a table of `pshufb` shuffle
+masks indexed by eight mask bits at a time, as simdjson's minifier does. It is
+untried here.
+
+**simdcsv itself is unmeasured on x86**, so there is no gap to quote yet --
+and simdcsv has no AVX-512 path, so a comparison would say as much about the
+instruction set as about either implementation.
 
 ## Streaming
 
