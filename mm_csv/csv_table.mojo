@@ -313,6 +313,12 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
         var offset = 0
         var written = 0
 
+        # Hoisted out of the loop. Every write below goes through this; left
+        # as `self._slots`, each store could as far as the compiler knows
+        # alias the field holding the pointer, so it would reload it every
+        # time. Refreshed after a grow, which is the only thing that moves it.
+        var slots = self._slots
+
         while offset + CHUNK <= length:
             var b0 = ptr.unsafe_offset(offset).unsafe_load[width=16]()
             var b1 = ptr.unsafe_offset(offset + 16).unsafe_load[width=16]()
@@ -371,6 +377,7 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                 if written + _SLACK > self._capacity:
                     self._count = written
                     self._reserve(self._capacity * 2 + _SLACK)
+                    slots = self._slots
 
                 # Unrolled. The profile said this loop was nearly half the
                 # scan, most of it a branch per delimiter; groups of eight
@@ -385,7 +392,7 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                     var flag0 = Self._CRLF_BIT if (
                         crlf >> UInt64(lane0)
                     ) & 1 != 0 else UInt32(0)
-                    self._slots[unsafe_offset=written + j] = (
+                    slots[unsafe_offset=written + j] = (
                         UInt32(offset + lane0) | flag0
                     )
                     bits &= bits - 1
@@ -395,7 +402,7 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                         var flag8 = Self._CRLF_BIT if (
                             crlf >> UInt64(lane8)
                         ) & 1 != 0 else UInt32(0)
-                        self._slots[unsafe_offset=written + j] = (
+                        slots[unsafe_offset=written + j] = (
                             UInt32(offset + lane8) | flag8
                         )
                         bits &= bits - 1
@@ -405,7 +412,7 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                         var flag16 = Self._CRLF_BIT if (
                             crlf >> UInt64(lane16)
                         ) & 1 != 0 else UInt32(0)
-                        self._slots[unsafe_offset=written + j] = (
+                        slots[unsafe_offset=written + j] = (
                             UInt32(offset + lane16) | flag16
                         )
                         bits &= bits - 1
@@ -415,7 +422,7 @@ struct CsvTable[separator: UInt8 = COMMA](Movable, Sized):
                         var flag32 = Self._CRLF_BIT if (
                             crlf >> UInt64(lane32)
                         ) & 1 != 0 else UInt32(0)
-                        self._slots[unsafe_offset=written + j] = (
+                        slots[unsafe_offset=written + j] = (
                             UInt32(offset + lane32) | flag32
                         )
                         bits &= bits - 1

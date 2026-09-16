@@ -228,13 +228,54 @@ is what simdcsv was tuned on: it reports buffering as its biggest win after
 the bitmask work, and that claim was measured on a different machine, a
 different compiler and a different instruction set.
 
-### What is left
+### Re-profiled, and the index writes are now most of what is left
 
-simdcsv is 1.16x ahead, 11.1 GB/s against 9.6, and nothing on its list remains
-untried. The scan also wants re-profiling before anything else is attempted:
-the last breakdown predates the bulk movemask and the carry-less multiply,
-both of which cut the phase that was largest when it was taken, so it no
-longer describes where the time goes.
+The earlier phase breakdown predated the bulk movemask and the carry-less
+multiply, so it was re-done. It is not reported here, because it turned out
+not to be measuring the same thing: the harness put the whole scan at 1305 us
+where the real one takes 2293, and a harness that disagrees with reality by
+75% has nothing to say about where reality spends its time. Two of its phases
+were also invalid on inspection -- the "walk, but do not store" phase
+XOR-accumulates each value, which is a dependency chain the real code does not
+have, and it measured *slower* than the phase that stores.
+
+Ablating the real scan instead, with the same binary harness used everywhere
+else -- best of 400 parses, results deliberately wrong, timing only:
+
+| | microseconds | share |
+| --- | ---: | ---: |
+| the scan as it stands | 2293 | |
+| with the unrolled emit removed | 1408 | |
+| **so the emit costs** | **885** | **39%** |
+| of which stores alone, timed on their own | 525 | 23% |
+| leaving the count-trailing-zeros and flag work | ~360 | 16% |
+| the per-chunk capacity check | ~14 | 0.6% |
+
+The store figure is measured separately: writing 2 042 888 `UInt32`s costs
+525 us whether the pages are fresh or warm -- they are identical to within
+0.4%, so this is not page faults -- which is about one store per cycle. That
+is the store port, and no amount of cleverness upstream moves it.
+
+**That reframes the remaining gap.** simdcsv runs the same document at
+11.1 GB/s, which is 2077 us against our 2293: 216 us apart. Both have to write
+the same 2 042 888 four-byte indexes, so of that, simdcsv spends about 1552 us
+on everything that is not storing and this spends 1768. The two
+implementations are within about 14% of each other on the work that is
+actually optional, and both are carrying the same ~525 us floor.
+
+Anything further has to come from writing less, not from scanning faster. Two
+shapes that would:
+
+- **Do not materialise the index at all** for callers that stream. An iterator
+  that yields fields as the scan finds them would skip the writes entirely,
+  and for a one-pass consumer -- sum a column, filter rows -- that is the
+  whole 23%. It is a different type with a different bargain, not a change to
+  this one.
+- **Narrow the index.** Four bytes a field is already the minimum for a 2 GiB
+  document, but a document under 16 MiB needs only three, and one under 64 KiB
+  only two. A width chosen from the document length would cut the store
+  traffic by a quarter or a half. Whether the unaligned loads that come with a
+  three-byte index pay for themselves has not been measured.
 
 ## Choosing the scan automatically
 
