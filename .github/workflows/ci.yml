@@ -28,6 +28,19 @@ jobs:
       - name: Run tests
         run: pixi run test
 
+      # `pmull64` sits behind AArch64's `aes` feature and `has_neon()` does
+      # not imply it, so the scan has to ask for the feature itself. Getting
+      # that wrong does not fail the build cleanly -- the backend cannot
+      # select the instruction and ends the compile with
+      # `LLVM ERROR: Cannot select`, which aborts. This is what broke the
+      # first CI run here. Turning the bit off proves the fallback compiles.
+      - name: Build with the ARM carry-less multiply turned off
+        if: runner.arch == 'ARM64'
+        run: |
+          pixi run mojo build --target-features=-aes -I . \
+            test/test_csv.mojo -o "$RUNNER_TEMP/test_without_aes"
+          "$RUNNER_TEMP/test_without_aes"
+
       - name: Run the example
         run: pixi run main
 
