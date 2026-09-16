@@ -25,11 +25,26 @@ jobs:
         with:
           cache: true
 
+      # The output is echoed into a GitHub annotation as well as the log,
+      # because annotations are readable from the public API and logs are
+      # not. Diagnostic: remove once the macOS failure is understood.
       - name: Run tests
-        run: pixi run test
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! pixi run test 2>&1 | tee /tmp/mm_csv_test.log; then
+            echo "::error title=test output::$(tail -c 2000 /tmp/mm_csv_test.log | tr '\n%\r' '  ')"
+            exit 1
+          fi
 
       - name: Run the example
-        run: pixi run main
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! pixi run main 2>&1 | tee /tmp/mm_csv_main.log; then
+            echo "::error title=example output::$(tail -c 2000 /tmp/mm_csv_main.log | tr '\n%\r' '  ')"
+            exit 1
+          fi
 
   lint:
     name: format and docstrings
